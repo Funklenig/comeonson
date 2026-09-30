@@ -1,0 +1,426 @@
+#!/usr/bin/env python3
+"""Mechanical lung logger. Protocol 2 captures support deterministic replay.
+
+Run python Data_Logger.txt --port PORT. See README.md for controls and policy.
+"""
+import argparse
+import bisect
+import math
+import os
+import sys
+import time
+from collections import deque
+import serial
+import serial.tools.list_ports
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from peak_detection import (
+    DEFAULT_MAX_SENSOR_AGE_MS, DEFAULT_PEAK_THRESHOLD_FLOOR,
+    DEFAULT_PEAK_THRESHOLD_FRAC, DEFAULT_PEAK_TOLERANCE_PCT, DEFAULT_WARMUP_BREATHS,
+    PeakDetectionConfig, PeakFlowDetector, centred_moving_average, standard_flow)
+from analysis import MillisUnwrapper
+from recording_schema import Sample, parse_wire
+from recording import PRESET_NAMES, open_unique_csv_pair, open_unique_session
+from serial_link import (SerialLink, COMMANDS, PRESET_KEYS, SAFETY_OVERRIDE_KEYS,
+                         MOTION_OVERRIDE_KEYS, DEFAULT_RUN_SECONDS)
+NUM_PSENS = 7
+PHASE_NAMES = {-1: "n/a", 0: "expiration", 1: "inspiration"}
+
+COMMAND_HELP = ("Click a plot window, then press: "
+                "1-4 preset (auto-records, timed) | s sine | H hold | "
+                "X calib | m monitor | p stop/discard run | ? renegotiate after fault | q quit")
+
+def list_ports():
+    ports = list(serial.tools.list_ports.comports())
+    if not ports:
+        print("No serial ports found.")
+    for p in ports:
+        print(f"  {p.device}  —  {p.description}")
+    return ports
+
+
+def pick_port():
+    ports = list_ports()
+    if not ports:
+        print("Plug in the board and try again, or pass --port explicitly.")
+        sys.exit(1)
+    if len(ports) == 1:
+        print(f"Using the only port available: {ports[0].device}")
+        return ports[0].device
+    print()
+    for i, p in enumerate(ports):
+        print(f"  [{i}] {p.device}  —  {p.description}")
+    while True:
+        choice = input(f"Select port [0-{len(ports) - 1}]: ").strip()
+        try:
+            idx = int(choice)
+            if 0 <= idx < len(ports):
+                return ports[idx].device
+        except ValueError:
+            pass
+        print("Invalid selection, try again.")
+
+def visible_start(t, window_s):
+    """Index of the first sample within `window_s` seconds of the latest one.
+
+    Binary search rather than the previous linear scan: this runs three
+    times per frame over a buffer that can hold tens of thousands of
+    samples, and it was the second-largest cost in the redraw path.
+    """
+    if not t:
+        return 0
+    return bisect.bisect_left(t, max(0.0, t[-1] - window_s))
+
+
+def autoscale(ax, values, min_span=1.0, pad_frac=0.15):
+    """Pad around the visible min/max, never collapsing to a zero-height
+    window when the signal is flat."""
+    values = [v for v in values if math.isfinite(v)]
+    if not values:
+        return
+    lo, hi = min(values), max(values)
+    pad = max((hi - lo) * pad_frac, min_span)
+    ax.set_ylim(lo - pad, hi + pad)
+
+
+def set_title(fig, text):
+    try:
+        fig.canvas.manager.set_window_title(text)
+    except Exception:
+        pass  # backend-dependent; purely cosmetic
+
+
+def positive_int(value):
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
+def nonnegative_int(value):
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be zero or greater")
+    return parsed
+
+
+def positive_float(value):
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if not math.isfinite(parsed) or not (parsed > 0.0):
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
+def unit_fraction(value):
+    parsed = positive_float(value)
+    if parsed > 1.0:
+        raise argparse.ArgumentTypeError("must be no greater than one")
+    return parsed
+
+
+def percentage(value):
+    parsed = positive_float(value)
+    if parsed > 100.0:
+        raise argparse.ArgumentTypeError("must be no greater than 100")
+    return parsed
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--port", help="Serial port (e.g. COM5, /dev/ttyACM0). Prompts if omitted.")
+    ap.add_argument("--baud", type=positive_int, default=115200, help="Must match Serial.begin() in the sketch.")
+    ap.add_argument("--window", type=positive_float, default=20.0, help="Seconds of history shown on screen.")
+    ap.add_argument("--avg", type=positive_int, default=9,
+                    help="Trailing moving-average window for the live flow "
+                         "display and segmentation (samples; default: 9).")
+    ap.add_argument("--peak-smooth", type=positive_int, default=9,
+                    help="Centred moving-average window used for offline peak "
+                         "location. Independent default: 9; must be odd.")
+    ap.add_argument("--buffer", type=positive_float, default=180.0,
+                    help="Seconds of history retained in memory.")
+    ap.add_argument("--peak-threshold-frac", type=unit_fraction,
+                    default=DEFAULT_PEAK_THRESHOLD_FRAC,
+                    help="Fraction of the current phase target used to open an "
+                         "excursion (default: 0.35).")
+    ap.add_argument("--peak-threshold-floor", type=positive_float,
+                    default=DEFAULT_PEAK_THRESHOLD_FLOOR,
+                    help="Minimum excursion-opening threshold in slm, also used "
+                         "when no phase target is available (default: 1.5).")
+    ap.add_argument("--peak-exit", type=unit_fraction, default=0.5,
+                    help="Excursion closes when |flow| drops below this fraction "
+                         "of its latched adaptive threshold.")
+    ap.add_argument("--peak-min-samples", type=positive_int, default=9,
+                    help="Excursions shorter than this are discarded as noise.")
+    ap.add_argument("--peak-plateau", type=unit_fraction, default=0.99,
+                    help="Plateau = samples within this fraction of the peak; the "
+                         "peaks CSV reports the mean pressure across it. The 0.99 "
+                         "default limits Q-squared pressure variation to about 2%%.")
+    ap.add_argument("--warmup-breaths", type=nonnegative_int,
+                    default=DEFAULT_WARMUP_BREATHS,
+                    help="Initial complete breath cycles marked is_warmup in the "
+                         "peaks CSV (default: 3; rows are retained).")
+    ap.add_argument("--peak-tolerance-pct", type=percentage,
+                    default=DEFAULT_PEAK_TOLERANCE_PCT,
+                    help="Allowed absolute error from the phase's commanded "
+                         "peak flow before the peaks CSV marks a miss "
+                         "(default: 10%%).")
+    ap.add_argument("--max-sensor-age-ms", type=positive_float,
+                    default=DEFAULT_MAX_SENSOR_AGE_MS,
+                    help="Maximum flow/pressure sample age at a detected peak "
+                         "before sensor_timing_ok is false (default: 20 ms).")
+    ap.add_argument("--run-seconds", type=positive_float,
+                    default=DEFAULT_RUN_SECONDS,
+                    help="Duration of each preset's automatic recording before "
+                         "the actuator returns to hold (default: 180).")
+    ap.add_argument("--list-ports", action="store_true", help="List serial ports and exit.")
+    ap.add_argument('--gas-temperature-c', type=float)
+    ap.add_argument('--absolute-pressure-mbar', type=float)
+    ap.add_argument('--expected-expiration-sign', choices=('positive', 'negative'))
+    ap.add_argument('--max-sample-gap-us', type=positive_float, default=15000)
+    args = ap.parse_args()
+    try:
+        standard_flow(1.0, args.gas_temperature_c, args.absolute_pressure_mbar)
+    except ValueError as exc:
+        ap.error(str(exc))
+
+    if args.list_ports:
+        list_ports()
+        return
+
+    peak_config = PeakDetectionConfig(
+        threshold_frac=args.peak_threshold_frac,
+        min_threshold=args.peak_threshold_floor,
+        exit_frac=args.peak_exit,
+        min_samples=args.peak_min_samples,
+        plateau_frac=args.peak_plateau,
+        smooth_window=args.peak_smooth,
+        target_tolerance_frac=args.peak_tolerance_pct / 100.0,
+        max_sensor_age_us=args.max_sensor_age_ms * 1000.0,
+        warmup_breaths=args.warmup_breaths,
+        max_sample_gap_us=args.max_sample_gap_us,
+    )
+    port = args.port or pick_port()
+    print(f"Connecting to {port} @ {args.baud}...")
+    try:
+        link = SerialLink(port, args.baud, args.avg,
+                          buffer_seconds=args.buffer,
+                          peak_config=peak_config,
+                          run_seconds=args.run_seconds,
+                          gas_temperature_c=args.gas_temperature_c,
+                          absolute_pressure_mbar=args.absolute_pressure_mbar,
+                          expected_expiration_sign=args.expected_expiration_sign)
+    except (serial.SerialException, OSError) as e:
+        sys.exit(f"Couldn't open {port}: {e}\n"
+                 f"Close the Arduino Serial Monitor (only one program can hold "
+                 f"the port) and check the board is plugged in.")
+
+    # Native USB port opening may not reset the board. Wait through normal
+    # centre-hold, then require an acknowledgement emitted only from loop().
+    time.sleep(2.5)
+    if not link.wait_until_ready(5.0):
+        link.close()
+        sys.exit("Firmware did not acknowledge readiness within 5 seconds; "
+                 "the board may still be booting or running an incompatible "
+                 "sketch.")
+    print(f"Connected. {COMMAND_HELP}\n")
+
+    # Free up the keys we use from matplotlib's default keymaps (h/s/q/etc.
+    # are normally bound to home/save/back/quit) so on_key() is the only
+    # thing that responds to them.
+    for action in ("keymap.home", "keymap.back", "keymap.forward", "keymap.save",
+                   "keymap.quit", "keymap.grid", "keymap.yscale", "keymap.xscale",
+                   "keymap.pan", "keymap.zoom", "keymap.fullscreen", "keymap.all_axes",
+                   "keymap.help", "keymap.copy"):
+        if action in plt.rcParams:  # keymap entries vary across matplotlib versions
+            plt.rcParams[action] = []
+
+    def on_key(event):
+        key = event.key
+        if key in PRESET_KEYS:
+            if link.run_in_progress():
+                print("-> a timed run is already active; press 'p' to abort "
+                      "or H to keep and end it")
+                return
+            if link.begin_timed_run(int(key) - 1, key):
+                print(f"-> sent '{key}'  ({COMMANDS[key]})")
+        elif key in SAFETY_OVERRIDE_KEYS or key in MOTION_OVERRIDE_KEYS:
+            link.send_command(key)
+        elif key in COMMANDS:
+            if link.send_command(key):
+                print(f"-> sent '{key}'  ({COMMANDS[key]})")
+        elif event.key == "p":
+            link.abort_run()
+        elif event.key == "q":
+            plt.close("all")
+
+    # ---------------- Figure 1: flow sensor ----------------
+    fig_flow, ax_flow = plt.subplots(figsize=(8, 4.5))
+    set_title(fig_flow, "Flow sensor — live")
+    fig_flow.suptitle(COMMAND_HELP, fontsize=8)
+    raw_line, = ax_flow.plot([], [], lw=1, color="#a9c6e8", alpha=0.6, label="raw")
+    avg_line, = ax_flow.plot([], [], lw=2, color="#1f6feb", label=f"smoothed (avg {args.avg})")
+    target_line, = ax_flow.plot([], [], lw=1.2, ls="--", color="#7b1fa2",
+                                label="geometric target (local L/min)")
+    # Adaptive opening/exit levels follow the current phase target. The peak
+    # detector latches them per excursion; these lines are a live preview.
+    threshold_guides = []
+    for multiplier, style in ((1.0, "--"), (peak_config.exit_frac, ":")):
+        for sign in (1, -1):
+            guide = ax_flow.axhline(0, color="#c62828", lw=0.7,
+                                    ls=style, alpha=0.6)
+            threshold_guides.append((guide, multiplier, sign))
+    ax_flow.axhline(0, color="#999", lw=0.8)
+    ax_flow.set_xlabel("Time (s)")
+    ax_flow.set_ylabel("Flow (slm)")
+    ax_flow.grid(alpha=0.25)
+    ax_flow.legend(loc="upper right", fontsize=8)
+    flow_status = ax_flow.text(0.01, 0.97, "", transform=ax_flow.transAxes,
+                               va="top", fontsize=9, family="monospace")
+    fig_flow.canvas.mpl_connect("key_press_event", on_key)
+
+    # ---------------- Figure 2: actuator command/feedback ----------------
+    fig_act, ax_act = plt.subplots(figsize=(8, 4.5))
+    set_title(fig_act, "Actuator command / feedback — live")
+    fig_act.suptitle(COMMAND_HELP, fontsize=8)
+    cmd_line, = ax_act.plot([], [], lw=1.5, color="#e07b39", label="commanded (normalized DAC)")
+    fdbk_line, = ax_act.plot([], [], lw=1.5, color="#2ca02c", label="feedback (normalized DAC)")
+    ax_act.axhline(0, color="#999", lw=0.8)
+    ax_act.set_ylim(-115, 115)
+    ax_act.set_xlabel("Time (s)")
+    ax_act.set_ylabel("Position (100 × DAC offset / half-range)")
+    ax_act.grid(alpha=0.25)
+    ax_act.legend(loc="upper right", fontsize=8)
+    act_status = ax_act.text(0.01, 0.97, "", transform=ax_act.transAxes,
+                             va="top", fontsize=9, family="monospace")
+    fig_act.canvas.mpl_connect("key_press_event", on_key)
+
+    # ---------------- Figure 3: pressure sensors (7x SDP811) ----------------
+    fig_press, ax_press = plt.subplots(figsize=(8, 4.5))
+    set_title(fig_press, "Pressure sensors — live")
+    fig_press.suptitle(COMMAND_HELP, fontsize=8)
+    press_colors = plt.cm.tab10.colors  # 10 distinct colors, first 7 used
+    press_lines = []
+    for i in range(NUM_PSENS):
+        (line,) = ax_press.plot([], [], lw=1.3, color=press_colors[i], label=f"Psens{i + 1}")
+        press_lines.append(line)
+    ax_press.axhline(0, color="#999", lw=0.8)
+    ax_press.set_xlabel("Time (s)")
+    ax_press.set_ylabel("Differential pressure (Pa)")
+    ax_press.grid(alpha=0.25)
+    ax_press.legend(loc="upper right", fontsize=7, ncol=4)
+    press_status = ax_press.text(0.01, 0.97, "", transform=ax_press.transAxes,
+                                 va="top", fontsize=9, family="monospace")
+    fig_press.canvas.mpl_connect("key_press_event", on_key)
+
+    def set_xwindow(ax, t):
+        t_now = t[-1]
+        t_lo = max(0.0, t_now - args.window)
+        ax.set_xlim(t_lo, max(t_now, t_lo + 1.0))
+
+    def update_flow(_frame):
+        (t, flow_raw, flow_avg, flow_ok, flow_age_us, *_middle,
+         target_flow, target_peak, phase, _preset, _clamped) = link.plots.snapshot()
+        if not t:
+            return raw_line, avg_line, target_line
+        i0 = visible_start(t, args.window)
+        tw, raw_w, avg_w = t[i0:], flow_raw[i0:], flow_avg[i0:]
+        target_w = target_flow[i0:]
+        raw_line.set_data(tw, raw_w)
+        avg_line.set_data(tw, avg_w)
+        target_line.set_data(tw, target_w)
+        current_threshold = peak_config.opening_threshold(target_peak[-1])
+        for guide, multiplier, sign in threshold_guides:
+            guide.set_ydata([sign * current_threshold * multiplier] * 2)
+        set_xwindow(ax_flow, t)
+        autoscale(ax_flow, raw_w + avg_w + target_w)
+        remaining = link.run_remaining()
+        recording = link.run_in_progress()
+        rec = (f" [RUN {remaining:5.1f}s]" if remaining is not None else
+               (" [REC]" if recording else ""))
+        link_state = ("CONNECTED" if link.connected else
+                      f"DISCONNECTED: {link.connection_error or 'reader stopped'}")
+        flow_status.set_text(
+            f"flow: {flow_avg[-1]:7.2f} slm   "
+            f"geometric target: {target_flow[-1]:7.2f} local L/min   "
+            f"threshold: {current_threshold:5.2f} slm   "
+            f"phase: {PHASE_NAMES.get(phase[-1], phase[-1])}\n"
+            f"[{'OK' if flow_ok[-1] else 'SENSOR FAULT'}; "
+            f"age {flow_age_us[-1] / 1000.0:.2f} ms]{rec}\n{link_state}"
+        )
+        return raw_line, avg_line, target_line
+
+    def update_act(_frame):
+        (t, *_rest, cmd_dac, feedback_dac, cmd_pct, fdbk_pct,
+         _target_flow, _target_peak, _phase, preset, clamped) = link.plots.snapshot()
+        if not t:
+            return cmd_line, fdbk_line
+        i0 = visible_start(t, args.window)
+        cmd_line.set_data(t[i0:], cmd_pct[i0:])
+        fdbk_line.set_data(t[i0:], fdbk_pct[i0:])
+        set_xwindow(ax_act, t)
+        act_status.set_text(
+            f"cmd: {cmd_pct[-1]:6.1f}%   fdbk: {fdbk_pct[-1]:6.1f}%   "
+            f"({cmd_dac[-1]:4d}/{feedback_dac[-1]:7.2f} DAC)   "
+            f"mode: {PRESET_NAMES.get(preset[-1], preset[-1])}"
+            f"{'   [CLAMPED]' if clamped[-1] else ''}"
+        )
+        return cmd_line, fdbk_line
+
+    def update_press(_frame):
+        (t, _fr, _fa, _fo, _flow_age, psens_pa, psens_temp_avg,
+         psens_ok, psens_age_us, *_) = link.plots.snapshot()
+        if not t:
+            return tuple(press_lines)
+        i0 = visible_start(t, args.window)
+        tw = t[i0:]
+        all_vals = []
+        for i, pline in enumerate(press_lines):
+            yw = psens_pa[i][i0:]
+            pline.set_data(tw, yw)
+            all_vals.extend(yw)
+        set_xwindow(ax_press, t)
+        autoscale(ax_press, all_vals)
+        ok_count = sum(1 for i in range(NUM_PSENS) if psens_ok[i][-1])
+        valid_ages = [ages[-1] for ages, ok in zip(psens_age_us, psens_ok)
+                      if ok[-1] and ages[-1] >= 0]
+        age_text = (f"{max(valid_ages) / 1000.0:.2f} ms"
+                    if valid_ages else "unavailable")
+        press_status.set_text(
+            f"sensors ok: {ok_count}/{NUM_PSENS}   "
+            f"avg temp: {psens_temp_avg[-1]:5.1f} C   "
+            f"max valid age: {age_text}"
+        )
+        return tuple(press_lines)
+
+    anims = [
+        animation.FuncAnimation(fig_flow, update_flow, interval=80,
+                                blit=False, cache_frame_data=False),
+        animation.FuncAnimation(fig_act, update_act, interval=80,
+                                blit=False, cache_frame_data=False),
+        animation.FuncAnimation(fig_press, update_press, interval=80,
+                                blit=False, cache_frame_data=False),
+    ]
+
+    for fig in (fig_flow, fig_act, fig_press):
+        fig.tight_layout(rect=(0, 0, 1, 0.94))
+
+    try:
+        plt.show()  # blocks until all three windows are closed
+    except KeyboardInterrupt:
+        pass
+    finally:
+        del anims
+        link.close()
+
+if __name__ == '__main__':
+    main()
