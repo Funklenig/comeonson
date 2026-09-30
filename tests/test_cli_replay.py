@@ -1,0 +1,69 @@
+import json
+from pathlib import Path
+import runpy
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from unittest.mock import patch
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from analysis import AnalysisSession
+from recording_schema import parse_wire, event_record
+from serial_link import SerialLink
+from test_recording import FakeSerial
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class CliReplayTests(unittest.TestCase):
+    def test_production_peaks_match_original_main(self):
+        session = AnalysisSession(gas_temperature_c=20, absolute_pressure_mbar=1013)
+        session.set_origin(0, 0)
+        events = []
+        for line in (ROOT/'tests/fixtures/production_data2.csv').read_text().splitlines():
+            events.extend(session.push(parse_wire(line), host_unix=0).events)
+        events.extend(session.finish())
+        expected = json.loads((ROOT/'tests/fixtures/production_peaks.json').read_text())
+        self.assertEqual([event_record(event) for event in events], expected)
+        self.assertGreater(len(events), 0)
+
+    def test_bad_config_is_argparse_error(self):
+        result = subprocess.run([sys.executable, str(ROOT/'Data_Logger.txt'), '--port', 'unused',
+                                 '--peak-smooth', '2'], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('smooth_window must be odd', result.stderr)
+        self.assertNotIn('Traceback', result.stderr)
+
+    def test_calibration_gui_callbacks_render_named_snapshots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fake = FakeSerial()
+            link = SerialLink(None, 115200, 1, serial_instance=fake, run_seconds=None,
+                              recording_directory=directory)
+            self.addCleanup(link.close)
+            self.addCleanup(plt.close, 'all')
+            callbacks = []
+            real_sleep = time.sleep
+            def show():
+                for key in 'HXmnH':
+                    link.send_command(key)
+                self.assertTrue(link.stop_run())
+                for callback in callbacks:
+                    callback(0)
+                for number in plt.get_fignums():
+                    plt.figure(number).canvas.draw()
+                actuator = plt.figure(2).axes[0]
+                self.assertIn('raw A1: 1414', actuator.texts[0].get_text())
+                self.assertIn('target: centre', actuator.texts[0].get_text())
+            entry = runpy.run_path(str(ROOT/'Data_Logger.txt'))
+            with patch.object(sys, 'argv', ['Data_Logger.txt','--port','fake','--calibration']), \
+                 patch('serial_link.SerialLink', return_value=link), \
+                 patch('matplotlib.animation.FuncAnimation', side_effect=lambda fig, fn, **kw: callbacks.append(fn)), \
+                 patch('matplotlib.pyplot.show', side_effect=show), \
+                 patch('time.sleep', side_effect=lambda seconds: None if seconds == 2.5 else real_sleep(seconds)):
+                # run_path captured imports before patch; supply factory in main's globals.
+                entry['main'].__globals__['SerialLink'] = lambda *args, **kw: link
+                entry['main']()
