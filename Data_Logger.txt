@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mechanical lung logger. Protocol 2 captures support deterministic replay.
+"""Mechanical lung logger. Protocol 2/3 captures support deterministic replay.
 
 Run python Data_Logger.txt --port PORT. See README.md for controls and policy.
 """
@@ -28,7 +28,7 @@ PHASE_NAMES = {-1: "n/a", 0: "expiration", 1: "inspiration"}
 
 COMMAND_HELP = ("Click a plot window, then press: "
                 "1-4 preset (auto-records, timed) | s sine | H hold | "
-                "X calib | m monitor | p stop/discard run | ? renegotiate after fault | q quit")
+                "X reference, m max, n min (calibration) | t monitor | p stop/discard run | ? renegotiate after fault | q quit")
 
 def list_ports():
     ports = list(serial.tools.list_ports.comports())
@@ -179,9 +179,10 @@ def main():
                     help="Maximum flow/pressure sample age at a detected peak "
                          "before sensor_timing_ok is false (default: 20 ms).")
     ap.add_argument("--run-seconds", type=positive_float,
-                    default=DEFAULT_RUN_SECONDS,
+                    default=None,
                     help="Duration of each preset's automatic recording before "
                          "the actuator returns to hold (default: 180).")
+    ap.add_argument("--calibration", action="store_true", help="Record one interactive CAL session; no default time limit.")
     ap.add_argument("--list-ports", action="store_true", help="List serial ports and exit.")
     ap.add_argument('--gas-temperature-c', type=float)
     ap.add_argument('--absolute-pressure-mbar', type=float)
@@ -197,25 +198,28 @@ def main():
         list_ports()
         return
 
-    peak_config = PeakDetectionConfig(
-        threshold_frac=args.peak_threshold_frac,
-        min_threshold=args.peak_threshold_floor,
-        exit_frac=args.peak_exit,
-        min_samples=args.peak_min_samples,
-        plateau_frac=args.peak_plateau,
-        smooth_window=args.peak_smooth,
-        target_tolerance_frac=args.peak_tolerance_pct / 100.0,
-        max_sensor_age_us=args.max_sensor_age_ms * 1000.0,
-        warmup_breaths=args.warmup_breaths,
-        max_sample_gap_us=args.max_sample_gap_us,
-    )
+    try:
+        peak_config = PeakDetectionConfig(
+            threshold_frac=args.peak_threshold_frac,
+            min_threshold=args.peak_threshold_floor,
+            exit_frac=args.peak_exit,
+            min_samples=args.peak_min_samples,
+            plateau_frac=args.peak_plateau,
+            smooth_window=args.peak_smooth,
+            target_tolerance_frac=args.peak_tolerance_pct / 100.0,
+            max_sensor_age_us=args.max_sensor_age_ms * 1000.0,
+            warmup_breaths=args.warmup_breaths,
+            max_sample_gap_us=args.max_sample_gap_us,
+        )
+    except ValueError as exc:
+        ap.error(str(exc))
     port = args.port or pick_port()
     print(f"Connecting to {port} @ {args.baud}...")
     try:
         link = SerialLink(port, args.baud, args.avg,
                           buffer_seconds=args.buffer,
                           peak_config=peak_config,
-                          run_seconds=args.run_seconds,
+                          run_seconds=args.run_seconds if args.run_seconds is not None else (None if args.calibration else DEFAULT_RUN_SECONDS),
                           gas_temperature_c=args.gas_temperature_c,
                           absolute_pressure_mbar=args.absolute_pressure_mbar,
                           expected_expiration_sign=args.expected_expiration_sign)
@@ -232,6 +236,9 @@ def main():
         sys.exit("Firmware did not acknowledge readiness within 5 seconds; "
                  "the board may still be booting or running an incompatible "
                  "sketch.")
+    if args.calibration and not link.begin_timed_run(-3):
+        link.close()
+        sys.exit('Calibration session could not start; upload protocol-3 calibration firmware.')
     print(f"Connected. {COMMAND_HELP}\n")
 
     # Free up the keys we use from matplotlib's default keymaps (h/s/q/etc.
@@ -328,8 +335,10 @@ def main():
         ax.set_xlim(t_lo, max(t_now, t_lo + 1.0))
 
     def update_flow(_frame):
-        (t, flow_raw, flow_avg, flow_ok, flow_age_us, *_middle,
-         target_flow, target_peak, phase, _preset, _clamped) = link.plots.snapshot()
+        snapshot = link.plots.snapshot()
+        t, flow_raw, flow_avg = snapshot.t, snapshot.flow_raw, snapshot.flow_avg
+        flow_ok, flow_age_us = snapshot.flow_ok, snapshot.flow_age_us
+        target_flow, target_peak, phase = snapshot.target_flow_slm, snapshot.target_peak_slm, snapshot.phase
         if not t:
             return raw_line, avg_line, target_line
         i0 = visible_start(t, args.window)
@@ -360,8 +369,10 @@ def main():
         return raw_line, avg_line, target_line
 
     def update_act(_frame):
-        (t, *_rest, cmd_dac, feedback_dac, cmd_pct, fdbk_pct,
-         _target_flow, _target_peak, _phase, preset, clamped) = link.plots.snapshot()
+        snapshot = link.plots.snapshot()
+        t, cmd_dac, feedback_dac = snapshot.t, snapshot.cmd_dac, snapshot.feedback_dac
+        cmd_pct, fdbk_pct = snapshot.cmd_pct, snapshot.fdbk_pct
+        preset, clamped = snapshot.preset, snapshot.clamped
         if not t:
             return cmd_line, fdbk_line
         i0 = visible_start(t, args.window)
@@ -372,13 +383,15 @@ def main():
             f"cmd: {cmd_pct[-1]:6.1f}%   fdbk: {fdbk_pct[-1]:6.1f}%   "
             f"({cmd_dac[-1]:4d}/{feedback_dac[-1]:7.2f} DAC)   "
             f"mode: {PRESET_NAMES.get(preset[-1], preset[-1])}"
+            f"   raw A1: {snapshot.pot_raw_adc[-1]}   target: {snapshot.calibration_position[-1]}"
             f"{'   [CLAMPED]' if clamped[-1] else ''}"
         )
         return cmd_line, fdbk_line
 
     def update_press(_frame):
-        (t, _fr, _fa, _fo, _flow_age, psens_pa, psens_temp_avg,
-         psens_ok, psens_age_us, *_) = link.plots.snapshot()
+        snapshot = link.plots.snapshot()
+        t, psens_pa, psens_temp_avg = snapshot.t, snapshot.psens_pa, snapshot.psens_temp_avg
+        psens_ok, psens_age_us = snapshot.psens_ok, snapshot.psens_age_us
         if not t:
             return tuple(press_lines)
         i0 = visible_start(t, args.window)
@@ -420,7 +433,9 @@ def main():
         pass
     finally:
         del anims
-        link.close()
+        result = link.close()
+        if result is not None and not result.recording_complete:
+            sys.exit(f'Recording incomplete: {result.failure_reason}; stop confirmed={result.stop_confirmed}')
 
 if __name__ == '__main__':
     main()
