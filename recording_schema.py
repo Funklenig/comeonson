@@ -14,10 +14,29 @@ Sample = namedtuple("Sample", [
     "run_id", "scan_id", "row_us", "cycle_id", "scan_start_us",
     "missed_slots_total", "tx_dropped_total", "row_time_us", "flow_time_us",
     "pa_time_us", "segment_id", "discontinuity_reason", "target_reference_resolved",
-    "target_peak_local_lmin",
+    "target_peak_local_lmin", "pot_raw_adc", "calibration_position",
 ])
 
 META_KEYS = set('core tidal_ml bore_mm stroke_mm dac_centre dac_half_range dac_corr_offset dac_corr_gain pot_raw_centre pot_dac_per_adc calibration_target slot_us sfm_scale flow_reference'.split())
+META_KEYS_V3 = (META_KEYS - {'calibration_target'}) | set('firmware_role cal_centre_dac cal_reference_dac cal_max_dac cal_min_dac'.split())
+POSITIONS = frozenset(('none', 'centre', 'reference', 'max', 'min'))
+
+def valid_metadata(version, metadata):
+    if set(metadata) != (META_KEYS_V3 if version == 3 else META_KEYS):
+        return False
+    if version == 3:
+        if metadata['firmware_role'] not in ('production', 'calibration'):
+            return False
+        try:
+            for key in ('cal_centre_dac', 'cal_reference_dac', 'cal_max_dac', 'cal_min_dac'):
+                if key in ('cal_max_dac', 'cal_min_dac') and metadata[key] == 'unset':
+                    continue
+                if not 0 <= int(metadata[key]) <= 4095:
+                    return False
+        except ValueError:
+            return False
+    return True
+
 SAMPLE_COLUMNS = ['wire_line'] + list(Sample._fields)
 PEAK_COLUMNS = ['peak_idx', 'seq', 'cycle_id', 'phase', 'direction', 'flow_peak_slm',
                 'plateau_reference_flow_slm', 'peak_time_s', 'peak_offset_s',
@@ -46,8 +65,8 @@ def uint32(value):
 
 def parse_wire(line):
     p = line.split(',')
-    protocol = {'DATA': 1, 'DATA2': 2}.get(p[0])
-    if protocol is None or len(p) != (37 if protocol == 1 else 44):
+    protocol = {'DATA': 1, 'DATA2': 2, 'DATA3': 3}.get(p[0])
+    if protocol is None or len(p) != {1: 37, 2: 44, 3: 46}.get(protocol):
         raise ValueError('unknown DATA schema/width')
     def finite(i):
         value = float(p[i])
@@ -66,21 +85,33 @@ def parse_wire(line):
     flow_ok = flag(4)
     pok = [flag(i) for i in range(14, 21)]
     phase, preset, dac = int(p[34]), int(p[35]), int(p[28])
-    if phase not in (-1, 0, 1) or preset not in (-2, -1, 0, 1, 2, 3) or not 0 <= dac <= 4095:
+    if phase not in (-1, 0, 1) or preset not in ((-3, -2, -1, 0, 1, 2, 3) if protocol == 3 else (-2, -1, 0, 1, 2, 3)) or not 0 <= dac <= 4095:
         raise ValueError('invalid phase/preset/DAC')
     if (preset >= 0 and phase == -1) or (preset < 0 and phase != -1):
         raise ValueError('phase/preset mismatch')
-    rid = p[37] if protocol == 2 else None
-    if protocol == 2 and not re.fullmatch('[0-9a-f]{16}', rid):
+    rid = p[37] if protocol >= 2 else None
+    if protocol == 3 and rid == '-':
+        rid = None
+    if protocol >= 2 and rid is not None and not re.fullmatch('[0-9a-f]{16}', rid):
         raise ValueError('invalid run ID')
-    return dict(protocol=protocol, seq=uint32(p[1]), ms=uint32(p[2]),
+    raw = int(p[44]) if protocol == 3 else None
+    position = p[45] if protocol == 3 else None
+    if protocol == 3:
+        if not 0 <= raw <= 4095 or position not in POSITIONS:
+            raise ValueError('invalid calibration fields')
+        if preset == -3:
+            if position == 'none' or finite(32) != 0 or finite(33) != 0:
+                raise ValueError('invalid CAL sample')
+        elif position != 'none':
+            raise ValueError('calibration position outside CAL mode')
+    return dict(pot_raw_adc=raw, calibration_position=position, protocol=protocol, seq=uint32(p[1]), ms=uint32(p[2]),
                 flow_raw=finite(3), flow_ok=flow_ok, flow_age_us=age(5, flow_ok),
                 pa=[finite(i) for i in range(6, 13)], temp=finite(13), pok=pok,
                 pa_age_us=[age(i, ok) for i, ok in zip(range(21, 28), pok)],
                 cmd_dac=dac, feedback_dac=finite(29), cmd_pct=finite(30), fdbk_pct=finite(31),
                 target_flow_slm=finite(32), target_peak_slm=finite(33), phase=phase, preset=preset,
                 clamped=flag(36), run_id=rid,
-                **{key: uint32(p[i]) if protocol == 2 else None for key, i in
+                **{key: uint32(p[i]) if protocol >= 2 else None for key, i in
                    zip(('scan_id', 'row_us', 'cycle_id', 'scan_start_us', 'missed_slots_total', 'tx_dropped_total'), range(38, 44))})
 
 

@@ -5,7 +5,7 @@ import json
 import os
 import time
 import traceback
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from analysis import AnalysisSession, BoardTimeReset
 from recording_schema import (SAMPLE_COLUMNS, PEAK_COLUMNS, SOFTWARE_FILES,
@@ -13,12 +13,19 @@ from recording_schema import (SAMPLE_COLUMNS, PEAK_COLUMNS, SOFTWARE_FILES,
 
 SCRIPT_DIR = str(Path(__file__).resolve().parent)
 RECORDINGS_DIR = os.path.join(SCRIPT_DIR, 'recordings')
-PRESET_NAMES = {-2: 'demo-sine', -1: 'idle/hold', 0: 'preset 1',
+PRESET_NAMES = {-3: 'calibration', -2: 'demo-sine', -1: 'idle/hold', 0: 'preset 1',
                 1: 'preset 2', 2: 'preset 3', 3: 'preset 4'}
 POPULATIONS = ('count', 'discarded', 'target_passes', 'target_misses',
                'partial_excursions', 'warmup_peaks', 'reference_unresolved',
                'pressure_incomplete', 'timing_failures', 'qualified_peaks',
                'unqualified_peaks')
+
+@dataclass(frozen=True)
+class CompletionResult:
+    stop_confirmed: bool
+    recording_complete: bool
+    failure_reason: object = None
+
 
 class RecordingError(Exception):
     def __init__(self, kind, cause):
@@ -74,8 +81,8 @@ class Recording:
     """All methods run on the recording owner, except allocation before START."""
     def __init__(self, avg_window=1, config=None, gas_temperature_c=None,
                  absolute_pressure_mbar=None, expected_expiration_sign=None,
-                 directory=None):
-        self.analysis = AnalysisSession(avg_window, config, gas_temperature_c, absolute_pressure_mbar)
+                 directory=None, *, score_peaks=True):
+        self.analysis = AnalysisSession(avg_window, config, gas_temperature_c, absolute_pressure_mbar, score_peaks=score_peaks)
         self.expected_expiration_sign = expected_expiration_sign
         self.directory = directory
         self._record_file = self._peak_file = None
@@ -83,6 +90,7 @@ class Recording:
         self._record_path = self._peak_path = self._manifest_path = None
         self.manifest = None
         self.started = self.failed = False
+        self.failure_reason = None
         self.rows = self.bad_lines = self.orientation_mismatches = 0
         self._phase_first = self._phase_last = None
         self._completed_phases = set()
@@ -107,7 +115,8 @@ class Recording:
             self._peak_writer.writeheader()
             a = self.analysis
             self.manifest = dict(
-                protocol_version=2, sample_schema=2, peak_schema=2, analysis_policy=2,
+                protocol_version=3 if metadata.get('firmware_role') else 2, sample_schema=3, peak_schema=2,
+                analysis_policy='calibration' if mode == 'CAL' else 2,
                 run_id=run_id, mode=mode, preset=preset,
                 detector_config=asdict(a.config), avg_window=a.avg_window,
                 expected_expiration_sign=self.expected_expiration_sign,
@@ -135,13 +144,14 @@ class Recording:
                 print(f'-> partial allocation files retained: {paths}')
             return None
         self.started = self.failed = False
+        self.failure_reason = None
         self.rows = self.bad_lines = self.orientation_mismatches = 0
         self._phase_first = self._phase_last = None
         self._completed_phases = set()
         return paths
 
     def start(self, start_ms, start_us):
-        self.analysis.reset(start_ms, start_us)
+        self.analysis.set_origin(start_ms, start_us)
         self.manifest['boundaries'] = self.analysis.boundaries
         self.manifest['start_ack'] = dict(millis=start_ms, micros=start_us)
         self._save_manifest()
@@ -152,7 +162,7 @@ class Recording:
             return None
         if wire['run_id'] != self.manifest['run_id'] or wire['preset'] != self.manifest['preset']:
             raise RecordingError('unexpected_session', 'sample identity mismatch')
-        if wire['protocol'] != 2:
+        if wire['protocol'] != self.manifest['protocol_version']:
             raise RecordingError('legacy_row_in_v2_session', 'protocol mismatch')
         try:
             result = self.analysis.push(wire, host_unix=host_unix)
@@ -246,65 +256,58 @@ class Recording:
                     first_phase_partial=first not in self._completed_phases,
                     last_phase_partial=last not in self._completed_phases)
 
+    def mark_failure(self, reason):
+        """Called only by the storage owner; keep the first failure after cleanup."""
+        self.failed = True
+        self.failure_reason = self.failure_reason or reason
+
     def finish(self, reason, tail_truncated=False, end_ack=None):
-        if self._record_file is None:
-            # A fault can arrive while final filesystem publication is blocked.
-            # The owner processes that ordered correction before signalling done.
-            if tail_truncated and self.manifest is not None:
-                self.manifest.update(complete=False, tail_truncated=True, termination_reason=reason)
-                try:
-                    self._save_manifest()
-                except OSError as exc:
-                    print(f'-> storage fault correcting manifest: {exc}')
-            return
         if end_ack is not None:
             self.manifest['end_ack'] = end_ack
-            last_seq = self.analysis.last_seq
-            tail_truncated |= (end_ack['final_enqueued_seq'] != (last_seq if last_seq is not None else -1)
-                               or self.analysis.dropped_rows > 0 or self.bad_lines > 0
-                               or end_ack['tx_dropped_total'] > 0)
-        # Failed analysis/persistence is never invoked again during teardown.
-        if not self.failed:
-            try:
-                events = self.analysis.finish()
-            except Exception as exc:
-                traceback.print_exc()
-                self.failed = True
-                reason = 'analysis_fault'
-            else:
+        ack = self.manifest.get('end_ack')
+        if tail_truncated:
+            self.mark_failure(reason)
+        if self._record_file is not None:
+            if not self.failed:
                 try:
-                    self._write_events(events)
-                except (OSError, RecordingError) as exc:
-                    self.failed = True
-                    reason = exc.kind if isinstance(exc, RecordingError) else 'storage_fault'
-                    print(f'-> {reason} finalizing recording: {exc}')
-        counters = {name: getattr(self.analysis.detector, name) for name in POPULATIONS}
-        for stream in (self._record_file, self._peak_file):
-            try:
-                stream.flush()
-                stream.close()
-            except OSError as exc:
-                self.failed = True
-                reason = 'storage_fault'
-                print(f'-> storage fault closing recording: {exc}')
+                    self._write_events(self.analysis.finish())
+                except Exception as exc:
+                    kind = exc.kind if isinstance(exc, RecordingError) else (
+                        'storage_fault' if isinstance(exc, OSError) else 'analysis_fault')
+                    self.mark_failure(kind)
+            for stream in (self._record_file, self._peak_file):
                 try:
+                    stream.flush()
                     stream.close()
-                except OSError:
-                    pass
-        self.manifest.update(complete=not (tail_truncated or self.failed),
-                             tail_truncated=tail_truncated or self.failed, termination_reason=reason,
-                             rows=self.rows, missing_rows=self.analysis.dropped_rows,
-                             invalid_rows=self.bad_lines, orientation_mismatches=self.orientation_mismatches,
-                             populations=counters, commanded_phases=self._phase_summary())
-        try:
-            self._save_manifest()
-        except OSError as exc:
-            self.failed = True
-            self.manifest.update(complete=False, tail_truncated=True, termination_reason='storage_fault')
-            print(f'-> storage fault publishing manifest: {exc}; original remains incomplete')
-            raise RecordingError('storage_fault', exc) from exc
-        finally:
+                except Exception:
+                    self.mark_failure('storage_fault')
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
             self._record_file = self._peak_file = None
             self._record_writer = self._peak_writer = None
-            self.started = False
-        print(f'-> recording populations (main totals exclude warmup/partial/unresolved): {counters}')
+        last_seq = self.analysis.last_seq
+        tail_missing = ack is None or ack['final_enqueued_seq'] != (last_seq if last_seq is not None else -1)
+        tx_drops = max(self.analysis.firmware_tx_drops, ack['tx_dropped_total'] if ack else 0)
+        incomplete = (self.failed or tail_missing or self.analysis.dropped_rows or
+                      self.analysis.missed_acquisition_slots or self.bad_lines or tx_drops)
+        if incomplete and self.failure_reason is None:
+            self.failure_reason = 'stop_unconfirmed' if ack is None else 'capture_incomplete'
+        self.manifest.update(
+            complete=not bool(incomplete), tail_truncated=bool(tail_missing or tail_truncated),
+            termination_reason=self.failure_reason or reason, failure_reason=self.failure_reason,
+            rows=self.rows, missing_rows=self.analysis.dropped_rows,
+            missed_acquisition_slots=self.analysis.missed_acquisition_slots,
+            firmware_tx_drops=tx_drops, invalid_rows=self.bad_lines,
+            orientation_mismatches=self.orientation_mismatches,
+            populations={name: getattr(self.analysis.detector, name) for name in POPULATIONS},
+            commanded_phases=self._phase_summary())
+        try:
+            self._save_manifest()
+        except Exception:
+            self.mark_failure('storage_fault')
+            self.manifest.update(complete=False, failure_reason=self.failure_reason,
+                                 termination_reason=self.failure_reason)
+        self.started = False
+        return CompletionResult(ack is not None, self.manifest['complete'], self.failure_reason)
