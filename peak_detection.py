@@ -101,7 +101,10 @@ def standard_flow(local_flow, temperature_c, pressure_mbar):
         raise ValueError("flow reference inputs must be finite")
     if temperature_c <= -273.15 or pressure_mbar <= 0:
         raise ValueError("temperature must exceed absolute zero and pressure must be positive")
-    return local_flow * (pressure_mbar / 1013.0) * (293.15 / (temperature_c + 273.15))
+    result = local_flow * (pressure_mbar / 1013.0) * (293.15 / (temperature_c + 273.15))
+    if not math.isfinite(result):
+        raise ValueError('flow reference conversion must be finite')
+    return result
 
 
 def centred_moving_average(vals, window):
@@ -192,6 +195,10 @@ class PeakEvent(TypedDict):
 
 class PeakFlowDetector:
     """Baseline-armed, continuity-aware excursion analysis (policy version 2)."""
+    # Ten minutes at the nominal rate exceeds every supported breathing phase.
+    # A stuck signal closes as partial and must return to baseline before rearming.
+    MAX_EXCURSION_SAMPLES = 60000
+
     def __init__(self, config):
         self.config = config
         self._buf = []
@@ -211,6 +218,7 @@ class PeakFlowDetector:
         self._break_reason = reason
         events = self._close(False) if self._buf else []
         self._armed = False
+        self._exit = None
         self._previous = None
         return events
 
@@ -242,6 +250,8 @@ class PeakFlowDetector:
                 events.extend(self.break_continuity('phase_cycle_discontinuity'))
             elif self._sign * sample.flow_avg <= 0:
                 events.extend(self.break_continuity('sign_reversal_without_baseline'))
+            elif len(self._buf) >= self.MAX_EXCURSION_SAMPLES:
+                events.extend(self.break_continuity('excursion_limit'))
             else:
                 self._buf.append(sample)
         elif self._armed and abs(sample.flow_avg) >= threshold:
@@ -262,6 +272,10 @@ class PeakFlowDetector:
             return []
         smooth = centred_moving_average([s.flow_raw for s in samples], self.config.smooth_window)
         supported = [i for i, v in enumerate(smooth) if math.isfinite(v)]
+        if not supported or max(sign*smooth[i] for i in supported) <= 0:
+            self.discarded += 1
+            self.discard_reasons['invalid_peak'] = self.discard_reasons.get('invalid_peak', 0)+1
+            return []
         peak_index = max(supported, key=lambda i: sign*smooth[i])
         reference = sign*smooth[peak_index]
         peak_sample = samples[peak_index]
@@ -276,9 +290,13 @@ class PeakFlowDetector:
         means, stds, fractions = [], [], []
         for ch in range(7):
             vals = [s.pa[ch] for s in plateau if s.pok[ch] and math.isfinite(s.pa[ch])]
-            mean = sum(vals)/len(vals) if vals else float('nan')
-            means.append(mean)
-            stds.append(math.sqrt(sum((v-mean)**2 for v in vals)/len(vals)) if vals else float('nan'))
+            # Scale extreme finite inputs before squaring; keep ordinary replay arithmetic.
+            scale = max(map(abs, vals), default=0)
+            scale = scale if scale > 1e150 else 1.0
+            normalized = [v/scale for v in vals]
+            mean = sum(normalized)/len(vals) if vals else float('nan')
+            means.append(mean*scale)
+            stds.append(math.sqrt(sum((v-mean)**2 for v in normalized)/len(vals))*scale if vals else float('nan'))
             fractions.append(len(vals)/len(plateau) if plateau else 0)
         def pressure_ok(s):
             return all(ok and math.isfinite(v) for ok,v in zip(s.pok,s.pa))

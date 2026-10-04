@@ -8,7 +8,6 @@ import traceback
 from dataclasses import dataclass, field
 import serial
 from analysis import AnalysisSession, BoardTimeReset
-from peak_detection import PeakDetectionConfig
 from recording import Recording, CompletionResult
 from recording_schema import valid_metadata, parse_wire, uint32
 from recording_worker import RecordingWorker
@@ -40,6 +39,8 @@ class RunContext:
     start_monotonic: object = None
     start_deadline: float = 0
     stop_deadline: float = 0
+    finalize_timeout: float = 2.0
+    finalize_deadline: float = 0
     end_ack: object = None
     result: object = None
     failure_reason: object = None
@@ -145,19 +146,14 @@ class SerialLink:
             return False
 
     def send_command(self, ch):
-        if ch not in COMMANDS:
+        if self._stop.is_set() or ch not in COMMANDS:
             return False
         if ch == '?':
             with self._run_lock:
                 if self.state in ('STARTING', 'RUNNING', 'STOPPING', 'FINALIZING'):
                     print('-> finish the active run before renegotiating readiness')
                     return False
-                self._ready_event.clear()
-                self.protocol_version = None
-                self.metadata = None
-                self._meta_pending = None
-                self._meta_build = None
-                self._meta_invalid = False
+                self._reset_handshake()
                 with self._serial_write_lock:
                     return self._write_bytes_locked(b'\n?')
         role = (self.metadata or {}).get('firmware_role', 'production')
@@ -167,6 +163,10 @@ class SerialLink:
                     print('-> this key requires protocol-3 calibration firmware')
                     return False
                 if self.state != 'RUNNING' or self.mode != 'CAL':
+                    if ch in SAFETY_OVERRIDE_KEYS:
+                        with self._serial_write_lock:
+                            written = self._write_bytes_locked(('\n'+ch).encode('ascii'))
+                        return written and self.state != 'FAULTED'
                     print('-> start an acknowledged --calibration session first')
                     return False
                 key = {'m': 'cal_max_dac', 'n': 'cal_min_dac'}.get(ch)
@@ -219,10 +219,15 @@ class SerialLink:
     def _reader_loop(self):
         try:
             while not self._stop.is_set():
-                if self.worker is not None and self.state in ('STARTING', 'RUNNING', 'STOPPING'):
-                    unhealthy = self.worker.health_error()
-                    if unhealthy:
-                        self._fault(unhealthy)
+                with self._run_lock:
+                    if self.worker is not None and self.state in ('STARTING', 'RUNNING', 'STOPPING', 'FINALIZING'):
+                        if self.state == 'FINALIZING':
+                            unhealthy = ('incomplete_shutdown' if time.monotonic() >= self.run.finalize_deadline
+                                         else None)
+                        else:
+                            unhealthy = self.worker.health_error()
+                        if unhealthy:
+                            self._fault(unhealthy, expected_run_id=self.run_id)
                 if not self._send_heartbeat():
                     self._fault('transport_fault')
                     return
@@ -272,12 +277,19 @@ class SerialLink:
 
     def _handle_marker(self, line):
         try:
-            self._process_marker(line)
+            with self._run_lock:
+                self._process_marker(line)
         except OSError as exc:
             self._fault('storage_fault', exc)
         except Exception as exc:
             traceback.print_exc()
             self._fault('analysis_fault', exc)
+
+    def _reset_handshake(self):
+        self._ready_event.clear()
+        self.protocol_version = self.metadata = None
+        self._meta_pending = self._meta_build = None
+        self._meta_invalid = False
 
     def _process_marker(self, line):
         parts = line[2:].split(',')
@@ -285,15 +297,12 @@ class SerialLink:
         if kind == 'BOOT':
             if self.run_in_progress():
                 self._fault('board_reset')
-            self.protocol_version = None
-            self.metadata = None
-            self._ready_event.clear()
+            self._reset_handshake()
         elif kind == 'PROTOCOL' and len(parts) == 2 and parts[1] in ('2', '3'):
             if self.run_in_progress():
                 self._fault('unexpected_handshake')
+            self._reset_handshake()
             self.protocol_version = int(parts[1])
-            self.metadata = None
-            self._ready_event.clear()
         elif kind == 'META_BEGIN' and len(parts) == 3 and parts[1] == str(self.protocol_version):
             self._meta_build = parts[2]
             self._meta_pending = {}
@@ -368,6 +377,7 @@ class SerialLink:
                 self._transition('FINALIZING')
                 end_ack = dict(final_enqueued_seq=final_seq, reason=parts[4], tx_dropped_total=dropped)
                 self.run.end_ack = end_ack
+                self.run.finalize_deadline = time.monotonic() + self.run.finalize_timeout
                 self.run.ended.set()
                 self.worker.finish(parts[4], end_ack=end_ack)
 
@@ -424,6 +434,8 @@ class SerialLink:
     def begin_timed_run(self, preset_index, command=None):
         with self._run_lock:
             role = (self.metadata or {}).get('firmware_role', 'production')
+            if self._stop.is_set() or not self.connected:
+                return False
             if self.state != 'IDLE' or self.protocol_version not in (2, 3) or self.metadata is None:
                 print('-> runs require idle state and a complete protocol-2/3 handshake')
                 return False
@@ -472,6 +484,9 @@ class SerialLink:
         self.stop_run(generation=generation)
 
     def stop_run(self, generation=None, discard=False, timeout=2.0):
+        return self._stop_run(generation, discard, timeout)
+
+    def _stop_run(self, generation=None, discard=False, timeout=2.0, shutdown_deadline=None):
         with self._run_lock:
             if generation is not None and generation != self._run_generation:
                 return False
@@ -484,15 +499,21 @@ class SerialLink:
                 self._transition('STOPPING')
                 self._cancel_run_timer_locked()
                 run.stop_deadline = time.monotonic() + timeout
+                run.finalize_timeout = timeout
                 with self._serial_write_lock:
                     self._heartbeat_enabled = False
                     sent = self._write_bytes_locked(f'@STOP,{run.run_id}\n'.encode('ascii'), timeout=timeout)
                 if not sent:
                     self._fault('transport_fault', expected_run_id=run.run_id)
             deadline = run.stop_deadline or (time.monotonic()+timeout)
+        if shutdown_deadline is not None:
+            deadline = min(deadline, shutdown_deadline)
         # ENDED confirms the actuator separately from the filesystem barrier.
         if not run.ended.wait(max(0, deadline-time.monotonic())):
             self._fault('stop_unconfirmed', expected_run_id=run.run_id)
+        deadline = run.finalize_deadline or (time.monotonic()+timeout)
+        if shutdown_deadline is not None:
+            deadline = min(deadline, shutdown_deadline)
         if not run.finalized.wait(max(0, deadline-time.monotonic())):
             self._fault('incomplete_shutdown', expected_run_id=run.run_id)
         return bool(run.result and run.result.recording_complete)
@@ -544,7 +565,7 @@ class SerialLink:
     def close(self, timeout=5.0):
         deadline = time.monotonic()+timeout
         if self.run_in_progress():
-            self.stop_run(timeout=min(2.0, timeout))
+            self._stop_run(timeout=min(2.0, timeout), shutdown_deadline=deadline)
         self._stop.set()
         with self._run_lock:
             self._cancel_run_timer_locked()

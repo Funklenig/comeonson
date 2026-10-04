@@ -24,10 +24,11 @@ template<class T> T constrain(T value, T lo, T hi) { return std::max(lo,std::min
 struct FakeSerial {
   std::string input, output;
   int capacity=1024;
+  size_t write_limit=1024;
   void begin(int) {}
   int available() { return input.size(); }
   int read() { char c=input.front(); input.erase(0,1); return c; }
   int availableForWrite() { return capacity; }
-  size_t write(const uint8_t *bytes, size_t n) { output.append((const char*)bytes,n); return n; }
+  size_t write(const uint8_t *bytes, size_t n) { n=std::min(n,write_limit); output.append((const char*)bytes,n); return n; }
 };
 extern FakeSerial Serial;

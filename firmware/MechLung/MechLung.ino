@@ -14,14 +14,10 @@ static uint32_t slot_us = 0, phase_update_us = 0, scan_id = 0, cycle_id = 0, mis
 static uint32_t last_monitor_ms = 0;
 struct Preset {
   float q_peak_Lmin;
-  float k_area;
-  float a_mm;
-  int   a_dac_raw;
   int   a_dac_corr;
   float t_exp_us;
   float t_insp_us;
   float period_us;
-  float rr_bpm;
 };
 
 static Preset presets[4];
@@ -53,14 +49,10 @@ static void initPresets() {
     const float period_s = t_exp_s + t_insp_s;
 
     presets[i].q_peak_Lmin = q_Lmin[i];
-    presets[i].k_area      = k_area;
-    presets[i].a_mm        = a_mm;
-    presets[i].a_dac_raw   = a_dac;
     presets[i].a_dac_corr  = (int)((float)a_dac * gain_factor + 0.5f);
     presets[i].t_exp_us    = t_exp_s  * 1e6f;
     presets[i].t_insp_us   = t_insp_s * 1e6f;
     presets[i].period_us   = period_s * 1e6f;
-    presets[i].rr_bpm      = 60.0f / period_s;
   }
 }
 

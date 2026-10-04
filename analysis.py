@@ -5,6 +5,10 @@ from dataclasses import dataclass
 from recording_schema import Sample
 from peak_detection import PeakFlowDetector, PeakDetectionConfig, standard_flow, continuity_reason, PeakEvent
 
+class CaptureDiscontinuity(ValueError):
+    """Owned counters regressed or repeated; capture integrity is lost."""
+
+
 class BoardTimeReset(ValueError):
     """Board clock discontinuity."""
 
@@ -40,6 +44,8 @@ class MillisUnwrapper:
         return self.elapsed_ms / 1000.0, reset
 
 class AnalysisSession:
+    MAX_BOUNDARIES = 1024
+
     def __init__(self, avg_window=1, config=None, gas_temperature_c=None,
                  absolute_pressure_mbar=None, *, score_peaks=True):
         self.score_peaks = score_peaks
@@ -61,6 +67,8 @@ class AnalysisSession:
         self.firmware_tx_drops = 0
         self.owned = False
         self.boundaries = []
+        self.boundaries_omitted = 0
+        self._break_reason = None
         self.detector = PeakFlowDetector(self.config)
 
     def set_origin(self, start_ms, start_us):
@@ -73,14 +81,33 @@ class AnalysisSession:
 
     def break_continuity(self, reason, before_seq=None):
         self._flow_hist.clear()
+        events = self.detector.break_continuity(reason)
+        if self._break_reason == reason:
+            return events
+        self._break_reason = reason
         self.segment_id += 1
-        self.boundaries.append(dict(after_seq=self.last_seq, before_seq=before_seq, reason=reason))
-        return self.detector.break_continuity(reason)
+        if len(self.boundaries) < self.MAX_BOUNDARIES:
+            self.boundaries.append(dict(after_seq=self.last_seq, before_seq=before_seq, reason=reason))
+        else:
+            self.boundaries_omitted += 1
+        return events
 
     def finish(self):
         return self.detector.flush()
 
     def push(self, w, active=True, host_unix=None):
+        previous = self.last_sample
+        if self.owned and previous is not None:
+            for field in ('seq', 'scan_id', 'missed_slots_total', 'tx_dropped_total'):
+                value, prior = w[field], getattr(previous, field)
+                if value is None or prior is None:
+                    continue
+                delta = (value-prior) & 0xffffffff
+                if delta >= 0x80000000 or (field in ('seq', 'scan_id') and delta == 0):
+                    raise CaptureDiscontinuity(field + ' repeated or regressed')
+            if w['scan_id'] is not None and previous.scan_id is not None:
+                if (w['scan_id']-previous.scan_id) & 0xffffffff != (w['seq']-previous.seq) & 0xffffffff:
+                    raise CaptureDiscontinuity('scan and sequence increments disagree')
         elapsed_s, reset = self._clock.update(w['ms'])
         if reset:
             raise BoardTimeReset('millis reset')
@@ -124,6 +151,8 @@ class AnalysisSession:
                 if prior is None or delta < 0x80000000:
                     setattr(self, counter, getattr(self, counter) + delta)
         events = self.break_continuity(reason, w['seq']) if reason else []
+        if reason is None:
+            self._break_reason = None
         if w['flow_ok']:
             self._flow_hist.append(w['flow_raw'])
         # Divide before summing so finite extreme inputs cannot poison a
@@ -148,4 +177,6 @@ class AnalysisSession:
         self.last_sample = sample
         if active and self.score_peaks:
             events.extend(self.detector.push(sample, check_continuity=False))
+        if w['flow_ok']:
+            self._break_reason = None
         return AnalysisResult(sample, events)

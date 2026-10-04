@@ -228,16 +228,25 @@ def main():
                  f"Close the Arduino Serial Monitor (only one program can hold "
                  f"the port) and check the board is plugged in.")
 
+    try:
+        run_gui(link, args, peak_config)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        result = link.close()
+        if result is not None and not result.recording_complete and sys.exc_info()[0] is None:
+            sys.exit(f'Recording incomplete: {result.failure_reason}; stop confirmed={result.stop_confirmed}')
+
+
+def run_gui(link, args, peak_config):
     # Native USB port opening may not reset the board. Wait through normal
     # centre-hold, then require an acknowledgement emitted only from loop().
     time.sleep(2.5)
     if not link.wait_until_ready(5.0):
-        link.close()
         sys.exit("Firmware did not acknowledge readiness within 5 seconds; "
                  "the board may still be booting or running an incompatible "
                  "sketch.")
     if args.calibration and not link.begin_timed_run(-3):
-        link.close()
         sys.exit('Calibration session could not start; upload protocol-3 calibration firmware.')
     print(f"Connected. {COMMAND_HELP}\n")
 
@@ -429,13 +438,8 @@ def main():
 
     try:
         plt.show()  # blocks until all three windows are closed
-    except KeyboardInterrupt:
-        pass
     finally:
         del anims
-        result = link.close()
-        if result is not None and not result.recording_complete:
-            sys.exit(f'Recording incomplete: {result.failure_reason}; stop confirmed={result.stop_confirmed}')
 
 if __name__ == '__main__':
     main()

@@ -124,9 +124,9 @@ class RecordingTests(unittest.TestCase):
         analysis.set_origin(0, 0)
         first = parse_wire(row(seq=0, ms=1))
         analysis.push(first)
-        analysis.last_sample = analysis.last_sample._replace(seq=0xffffffff, missed_slots_total=0xffffffff)
+        analysis.last_sample = analysis.last_sample._replace(seq=0xffffffff, scan_id=0xffffffff, missed_slots_total=0xffffffff)
         analysis.last_seq = 0xffffffff
-        analysis.push(parse_wire(row(seq=0, ms=2)))
+        analysis.push(dict(parse_wire(row(seq=0, ms=2)), scan_id=0))
         self.assertEqual(analysis.dropped_rows, 0)
         self.assertEqual(analysis.missed_acquisition_slots, 1)
 

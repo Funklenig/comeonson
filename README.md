@@ -16,6 +16,20 @@ python3 -m venv .venv
 ```
 
 The full test suite also requires `g++` (C++17) for the synthetic firmware harness.
+Additional software acceptance checks (no board or serial port required):
+
+```sh
+xvfb-run -a .venv/bin/python scripts/smoke_gui.py
+.venv/bin/python scripts/soak_capture.py
+```
+
+The GUI smoke uses the real Tk backend, all three plot windows, keyboard callbacks,
+and a synthetic serial board for both roles. Linux needs Tk and Xvfb; on Amazon
+Linux install missing packages with `sudo dnf install python3-tkinter xorg-x11-server-Xvfb xorg-x11-xauth`.
+On a desktop with a display, omit `xvfb-run -a`. The soak writes 180,000 synthetic
+rows per role (30 simulated minutes each), checks manifests, peaks, bounded plot
+history and memory growth, then removes its temporary captures. It uses
+`tracemalloc`, so runtime is longer than an ordinary replay.
 Matplotlib needs a desktop display for interactive plot windows. `--list-ports`
 lists devices. Only one program can own the board's serial port.
 
@@ -127,7 +141,10 @@ separately determines recording success. CompletionResult exposes
 `stop_confirmed`, `recording_complete`, and `failure_reason`. A new handshake
 allows recovery after a fault once the worker exits. Old-run callbacks are ignored.
 
-The worker drains ordered samples before finalization. It is joined on close,
+The worker drains ordered samples before finalization. A requested stop has
+separate acknowledgement and storage-finalization deadlines (two seconds each by
+default); `close(timeout=...)` caps the entire shutdown. The reader uses the
+finalization deadline after ENDED rather than the shorter capture-latency limit. It is joined on close,
 including faulted runs. A shutdown deadline with blocked storage raises
 `IncompleteShutdownError`; the non-daemon worker remains alive until storage
 recovers. Python cannot safely kill a thread blocked in filesystem I/O.
@@ -150,8 +167,22 @@ These diagnostics are not summed. Any known capture loss, failed storage,
 unconfirmed end or missing tail makes `complete` false. Invalid sensor readings
 remain present with validity flags and ages; they affect peak quality separately
 from missing recording data. Sequence/counter wrap uses unsigned arithmetic.
-Peak scoring for production retains the existing smoothing/segmentation policy;
-repeated continuity-boundary coalescing remains deferred.
+Peak scoring for production retains the existing smoothing/segmentation policy.
+A discontinuity clears the latched threshold before the detector can rearm.
+Repeated invalid-flow/malformed-input notifications without a valid sample between
+them share a diagnostic boundary; every discontinuity still resets detection.
+The manifest retains at most 1,024 boundary details and reports additional ones
+in `boundaries_omitted`. CSV rows retain their segment IDs and discontinuity reasons.
+The detector caps an excursion at 60,000 samples (ten minutes at 100 Hz), closes
+it as partial with `excursion_limit`, and waits for a new baseline. These bounds
+are included in the additive `analysis_limits` manifest field. Phase summaries
+use constant memory and account for cycle rollover.
+
+Duplicate/backward row counters, inconsistent scan/sequence increments, regressing
+loss counters, or regressing commanded phases fault the capture explicitly.
+A manifest cannot be complete without STARTED and a consistent ENDED. Finite
+pressure extremes cannot overflow the variance calculation; nonfinite reference
+conversions and invalid numeric handshake metadata are rejected.
 
 ## Acceptance status and limitations
 
@@ -160,7 +191,13 @@ compatibility, concurrent stop/fault handling, blocked storage and injected
 analysis/flush/manifest failures. The native harness runs both actual sketches
 against simulated hardware and exercises calibration capture through the logger,
 continuous production hold, watchdog centre commands and command negotiation.
-Arduino compilation checks target compatibility separately.
+Arduino compilation checks target compatibility separately. The expanded harness
+covers valid flow and all seven pressure channels, CRC errors, short reads, NACKs,
+nonpositive pressure scales, recovery, clock rollover, delayed I2C, partial serial
+writes and blocked output. It exercises all production presets, demo mode,
+configured and unset calibration endpoints, duplicate/stale commands, and the
+64-completed-session limit. The board must be reset after 64 completed owned
+sessions; a new host handshake alone does not clear that firmware limit.
 
 **Physical acceptance is pending:** confirm the board, configure measured
 endpoints, measure travel and DAC/ADC scaling, and test watchdog return to centre

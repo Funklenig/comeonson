@@ -1,4 +1,4 @@
-"""Protocol 2 parsing and stable recording schemas; no transport or UI imports."""
+"""Protocol 1/2/3 parsing and stable recording schemas; no transport or UI imports."""
 import hashlib
 import json
 import math
@@ -23,6 +23,18 @@ POSITIONS = frozenset(('none', 'centre', 'reference', 'max', 'min'))
 
 def valid_metadata(version, metadata):
     if set(metadata) != (META_KEYS_V3 if version == 3 else META_KEYS):
+        return False
+    numeric = META_KEYS - {'core', 'flow_reference'}
+    if version == 3:
+        numeric = numeric - {'calibration_target'}
+    try:
+        values = {key: float(metadata[key]) for key in numeric}
+        if not all(math.isfinite(value) for value in values.values()):
+            return False
+        if any(values[key] <= 0 for key in ('tidal_ml', 'bore_mm', 'stroke_mm',
+                                           'dac_half_range', 'dac_corr_gain', 'slot_us', 'sfm_scale')):
+            return False
+    except (TypeError, ValueError):
         return False
     if version == 3:
         if metadata['firmware_role'] not in ('production', 'calibration'):

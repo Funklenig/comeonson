@@ -19,8 +19,23 @@ int main() {
       for (size_t i=0;i<hex.size();i+=2) Serial.input += (char)std::stoi(hex.substr(i,2),nullptr,16);
     } else if (operation=='T') {
       int us; input >> us;
-      for (int elapsed=0;elapsed<us;elapsed+=100) { simulated_us+=100; loop(); }
+      const uint64_t end=simulated_us+us;
+      while (simulated_us<end) { simulated_us+=100; loop(); }
     } else if (operation=='C') input >> Serial.capacity;
+    else if (operation=='L') input >> Serial.write_limit;
+    else if (operation=='J') input >> simulated_us;
+    else if (operation=='I') {
+      int bus,ch,mode; input >> bus >> ch >> mode;
+      (bus==0 ? Wire : Wire1).modes.at(ch)=mode;
+    } else if (operation=='D') {
+      int bus,latency; input >> bus >> latency;
+      (bus==0 ? Wire : Wire1).latency_us=latency;
+    } else if (operation=='R') input >> Wire.flow_raw;
+    else if (operation=='V') {
+      std::cout << "# RECOVERY," << Wire.starts[0];
+      for (int count : Wire1.starts) std::cout << ',' << count;
+      std::cout << '\n';
+    }
     else if (operation=='A') std::cout << "# APPLIED," << applied_dac << '\n';
     std::cout << Serial.output;
     Serial.output.clear();

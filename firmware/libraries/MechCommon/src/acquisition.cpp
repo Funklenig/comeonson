@@ -272,7 +272,8 @@ bool Acquisition::sdpRead(float &pressure_pa, float &temp_c) {
   int16_t raw_temp = (int16_t)((uint16_t)t_msb  << 8 | t_lsb);
   int16_t raw_sf   = (int16_t)((uint16_t)sf_msb << 8 | sf_lsb);
 
-  if (raw_sf == 0) return false;
+  // A scale is a positive magnitude; a negative value would invert pressure.
+  if (raw_sf <= 0) return false;
 
   pressure_pa = (float)raw_dp   / (float)raw_sf;
   temp_c      = (float)raw_temp / 200.0f;

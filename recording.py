@@ -7,7 +7,7 @@ import time
 import traceback
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from analysis import AnalysisSession, BoardTimeReset
+from analysis import AnalysisSession, BoardTimeReset, CaptureDiscontinuity
 from recording_schema import (SAMPLE_COLUMNS, PEAK_COLUMNS, SOFTWARE_FILES,
                               config_fingerprint, sample_record, event_record)
 
@@ -93,7 +93,9 @@ class Recording:
         self.failure_reason = None
         self.rows = self.bad_lines = self.orientation_mismatches = 0
         self._phase_first = self._phase_last = None
-        self._completed_phases = set()
+        self._completed_phase_count = 0
+        self._last_completed_phase = None
+        self._first_phase_complete = False
 
     @property
     def paths(self):
@@ -117,6 +119,8 @@ class Recording:
             self.manifest = dict(
                 protocol_version=3 if metadata.get('firmware_role') else 2, sample_schema=3, peak_schema=2,
                 analysis_policy='calibration' if mode == 'CAL' else 2,
+                analysis_limits=dict(max_boundaries=a.MAX_BOUNDARIES,
+                                     max_excursion_samples=a.detector.MAX_EXCURSION_SAMPLES),
                 run_id=run_id, mode=mode, preset=preset,
                 detector_config=asdict(a.config), avg_window=a.avg_window,
                 expected_expiration_sign=self.expected_expiration_sign,
@@ -147,7 +151,9 @@ class Recording:
         self.failure_reason = None
         self.rows = self.bad_lines = self.orientation_mismatches = 0
         self._phase_first = self._phase_last = None
-        self._completed_phases = set()
+        self._completed_phase_count = 0
+        self._last_completed_phase = None
+        self._first_phase_complete = False
         return paths
 
     def start(self, start_ms, start_us):
@@ -166,6 +172,8 @@ class Recording:
             raise RecordingError('legacy_row_in_v2_session', 'protocol mismatch')
         try:
             result = self.analysis.push(wire, host_unix=host_unix)
+        except CaptureDiscontinuity as exc:
+            raise RecordingError('capture_discontinuity', exc) from exc
         except BoardTimeReset as exc:
             raise RecordingError('board_time_reset', exc) from exc
         except Exception as exc:
@@ -175,8 +183,13 @@ class Recording:
         if sample.cycle_id is not None and sample.phase in (0, 1):
             ordinal = sample.cycle_id*2 + sample.phase
             if self._phase_first is None:
-                self._phase_first = ordinal
-            self._phase_last = ordinal
+                self._phase_first = self._phase_last = ordinal
+            else:
+                # A phase ordinal has the uint32 cycle plus one phase bit.
+                delta = (ordinal-self._phase_last) & 0x1ffffffff
+                if delta > 0xffffffff:
+                    raise RecordingError('capture_discontinuity', 'commanded phase regressed')
+                self._phase_last += delta
         try:
             self._record_writer.writerow(sample_record(sample, line))
             self.rows += 1
@@ -218,7 +231,12 @@ class Recording:
             raise RecordingError('format_fault', exc) from exc
         self._peak_file.flush()
         if event['excursion_complete'] and event['sample'].cycle_id is not None:
-            self._completed_phases.add(event['sample'].cycle_id*2+event['sample'].phase)
+            raw = event['sample'].cycle_id*2+event['sample'].phase
+            ordinal = self._phase_last - ((self._phase_last-raw) & 0x1ffffffff)
+            if ordinal != self._last_completed_phase:
+                self._completed_phase_count += 1
+                self._last_completed_phase = ordinal
+                self._first_phase_complete |= ordinal == self._phase_first
         if event['excursion_complete'] and self.expected_expiration_sign is not None:
             expected = 1 if self.expected_expiration_sign == 'positive' else -1
             if event['sample'].phase == 1:
@@ -250,11 +268,14 @@ class Recording:
         if first is None or last is None:
             return dict(missing_interior=0, first_phase_partial=False, last_phase_partial=False)
         interior = max(0, last-first-1)
-        completed = sum(first < phase < last for phase in self._completed_phases)
+        last_complete = last == self._last_completed_phase
+        completed = self._completed_phase_count - self._first_phase_complete
+        if last != first:
+            completed -= last_complete
         return dict(first_ordinal=first, last_ordinal=last,
                     missing_interior=max(0, interior-completed),
-                    first_phase_partial=first not in self._completed_phases,
-                    last_phase_partial=last not in self._completed_phases)
+                    first_phase_partial=not self._first_phase_complete,
+                    last_phase_partial=not last_complete)
 
     def mark_failure(self, reason):
         """Called only by the storage owner; keep the first failure after cleanup."""
@@ -289,7 +310,16 @@ class Recording:
             self._record_writer = self._peak_writer = None
         last_seq = self.analysis.last_seq
         tail_missing = ack is None or ack['final_enqueued_seq'] != (last_seq if last_seq is not None else -1)
-        tx_drops = max(self.analysis.firmware_tx_drops, ack['tx_dropped_total'] if ack else 0)
+        tx_drops = self.analysis.firmware_tx_drops
+        if ack is not None:
+            prior = self.analysis.last_sample.tx_dropped_total if self.analysis.last_sample else 0
+            delta = (ack['tx_dropped_total'] - (prior or 0)) & 0xffffffff
+            if delta >= 0x80000000:
+                self.mark_failure('capture_discontinuity')
+            else:
+                tx_drops += delta
+        if self.manifest['start_ack'] is None:
+            self.mark_failure('start_unconfirmed')
         incomplete = (self.failed or tail_missing or self.analysis.dropped_rows or
                       self.analysis.missed_acquisition_slots or self.bad_lines or tx_drops)
         if incomplete and self.failure_reason is None:
@@ -297,7 +327,7 @@ class Recording:
         self.manifest.update(
             complete=not bool(incomplete), tail_truncated=bool(tail_missing or tail_truncated),
             termination_reason=self.failure_reason or reason, failure_reason=self.failure_reason,
-            rows=self.rows, missing_rows=self.analysis.dropped_rows,
+            rows=self.rows, boundaries_omitted=self.analysis.boundaries_omitted, missing_rows=self.analysis.dropped_rows,
             missed_acquisition_slots=self.analysis.missed_acquisition_slots,
             firmware_tx_drops=tx_drops, invalid_rows=self.bad_lines,
             orientation_mismatches=self.orientation_mismatches,
