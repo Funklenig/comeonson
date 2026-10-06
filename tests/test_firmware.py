@@ -1,4 +1,4 @@
-"""Compile real sketches against synthetic GPIO/I2C/USB, then use the host logger."""
+"""Compile real sketches against synthetic GPIO/I2C/serial, then use the host logger."""
 import csv
 import json
 from pathlib import Path
@@ -72,12 +72,90 @@ class FirmwareTests(unittest.TestCase):
                           .replace('CAL_MAX_DAC = -1', 'CAL_MAX_DAC = 1800'))
         for binary, sketch, source_library in (('MechLung','MechLung',library),
                                                ('calibration','calibration',library),
+                                               ('MechLung_uart','MechLung',library),
+                                               ('calibration_uart','calibration',library),
                                                ('calibration_unset','calibration',ROOT/'firmware/libraries/MechCommon/src')):
             subprocess.run(['g++', '-std=c++17', '-Wall', '-Wextra', '-Werror',
+                            *(['-DARDUINO_UNOR4_WIFI', '-DNO_USB'] if binary.endswith('_uart') else []),
                             '-I'+str(ROOT/'tests/firmware_stubs'), '-I'+str(source_library),
                             '-DSKETCH_FILE="'+str(ROOT/'firmware'/sketch/(sketch+'.ino'))+'"',
                             str(ROOT/'tests/firmware_stubs/harness.cpp'),
                             *map(str, source_library.glob('*.cpp')), '-o', str(cls.directory/binary)], check=True)
+
+    def test_r4_wifi_uart_readiness_with_zero_available_for_write(self):
+        # Renesas 1.6.0 UART inherits Print.availableForWrite() == 0.
+        # Both roles must still deliver the entire validated handshake.
+        for sketch in ('MechLung_uart', 'calibration_uart'):
+            with self.subTest(sketch=sketch):
+                serial = self.harness(sketch)
+                self.assertEqual(serial.command('B'), b'# BAUD,460800\n')
+                link = SerialLink(None, 460800, 1, serial_instance=serial, run_seconds=None)
+                try:
+                    self.assertTrue(link.wait_until_ready(2))
+                    self.assertEqual(link.protocol_version, 3)
+                    self.assertEqual(link.metadata['firmware_role'],
+                                     'production' if sketch.startswith('MechLung') else 'calibration')
+                finally:
+                    link.close()
+
+    def test_r4_wifi_115200_bandwidth_loss_cannot_be_complete(self):
+        for sketch, preset in (('MechLung_uart', 0), ('calibration_uart', -3)):
+            with self.subTest(sketch=sketch):
+                serial = self.harness(sketch)
+                serial.command('Z 115200') # Reproduce the old wire rate in a temporary process.
+                self.healthy(serial)
+                link = SerialLink(None, 115200, 1, serial_instance=serial, run_seconds=None,
+                                  recording_directory=str(self.directory/(sketch+'_captures')))
+                try:
+                    self.assertTrue(link.wait_until_ready(2))
+                    self.assertTrue(link.begin_timed_run(preset))
+                    time.sleep(.25)
+                    self.assertFalse(link.stop_run()) # Reports recording loss despite acknowledged STOP.
+                    result = link.close()
+                    self.assertTrue(result.stop_confirmed)
+                    self.assertFalse(result.recording_complete)
+                    with open(link.recording.paths[2]) as stream:
+                        manifest = json.load(stream)
+                    self.assertFalse(manifest['complete'])
+                    with open(link.recording.paths[0]) as stream:
+                        rows = list(csv.DictReader(stream))
+                    self.assertGreater(len(rows), 0)
+                    self.assertTrue(any(int(row['tx_dropped_total']) > 0 for row in rows))
+                    # Even without loop/I2C overhead these rows cannot fit at 100 Hz.
+                    self.assertGreater(sum(len(row['wire_line'])+1 for row in rows)/len(rows)*100,
+                                       115200/10)
+                finally:
+                    link.close()
+
+    def test_r4_wifi_460800_complete_captures_with_sensor_latency(self):
+        for sketch, preset in (('MechLung_uart', 0), ('calibration_uart', -3)):
+            with self.subTest(sketch=sketch):
+                serial = self.harness(sketch)
+                self.assertEqual(serial.command('B'), b'# BAUD,460800\n')
+                serial.command('D 0 200')
+                serial.command('D 1 150')
+                self.healthy(serial)
+                link = SerialLink(None, 460800, 1, serial_instance=serial, run_seconds=None,
+                                  recording_directory=str(self.directory/(sketch+'_460800')))
+                try:
+                    self.assertTrue(link.wait_until_ready(2))
+                    self.assertTrue(link.begin_timed_run(preset))
+                    time.sleep(.6)
+                    self.assertTrue(link.stop_run())
+                    result = link.close()
+                    self.assertTrue(result.stop_confirmed)
+                    self.assertTrue(result.recording_complete)
+                    with open(link.recording.paths[2]) as stream:
+                        self.assertTrue(json.load(stream)['complete'])
+                    with open(link.recording.paths[0]) as stream:
+                        rows = list(csv.DictReader(stream))
+                    self.assertGreater(len(rows), 50)
+                    self.assertEqual([int(row['seq']) for row in rows], list(range(len(rows))))
+                    self.assertTrue(all(int(row['tx_dropped_total']) == 0 for row in rows))
+                    self.assertTrue(any(row['flow_ok'] == '1' for row in rows))
+                    self.assertTrue(any(json.loads(row['pok']) == [True]*7 for row in rows))
+                finally:
+                    link.close()
 
     def test_calibration_capture_real_sketch_to_csv(self):
         serial = FirmwareSerial(self.directory/'calibration')

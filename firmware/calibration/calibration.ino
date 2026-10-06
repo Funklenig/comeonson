@@ -55,7 +55,7 @@ static void dispatch(char key) {
 }
 void setup() {
   actuator.begin();
-  Serial.begin(115200);
+  Serial.begin(460800);
   delay(2000);
   acquisition.begin();
   slot_us = micros();

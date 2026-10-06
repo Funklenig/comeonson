@@ -20,8 +20,17 @@ int main() {
     } else if (operation=='T') {
       int us; input >> us;
       const uint64_t end=simulated_us+us;
-      while (simulated_us<end) { simulated_us+=100; loop(); }
-    } else if (operation=='C') input >> Serial.capacity;
+      while (simulated_us<end) {
+#if defined(ARDUINO_UNOR4_WIFI) && defined(NO_USB)
+        simulated_us+=1; // UART writes advance the clock by a byte time.
+#else
+        simulated_us+=100;
+#endif
+        loop();
+      }
+    } else if (operation=='B') std::cout << "# BAUD," << Serial.baud << '\n';
+    else if (operation=='Z') { int baud; input >> baud; assert(baud>0); Serial.begin(baud); }
+    else if (operation=='C') input >> Serial.capacity;
     else if (operation=='L') input >> Serial.write_limit;
     else if (operation=='J') input >> simulated_us;
     else if (operation=='I') {

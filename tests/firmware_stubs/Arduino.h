@@ -23,12 +23,24 @@ inline int analogRead(int) { raw_adc = 1400+(millis()%100); return raw_adc; }
 template<class T> T constrain(T value, T lo, T hi) { return std::max(lo,std::min(value,hi)); }
 struct FakeSerial {
   std::string input, output;
+#if defined(ARDUINO_UNOR4_WIFI) && defined(NO_USB)
+  int capacity=0; // Renesas UART inherits the unimplemented Print method.
+#else
   int capacity=1024;
+#endif
   size_t write_limit=1024;
-  void begin(int) {}
+  uint32_t baud=115200;
+  void begin(int value) { baud=value; }
   int available() { return input.size(); }
   int read() { char c=input.front(); input.erase(0,1); return c; }
   int availableForWrite() { return capacity; }
+  size_t write(uint8_t byte) {
+    if (!write_limit) return 0;
+    // One 8N1 byte, rounded up. No transmit FIFO in this core.
+    simulated_us += (10000000UL + baud - 1) / baud;
+    output += (char)byte;
+    return 1;
+  }
   size_t write(const uint8_t *bytes, size_t n) { n=std::min(n,write_limit); output.append((const char*)bytes,n); return n; }
 };
 extern FakeSerial Serial;

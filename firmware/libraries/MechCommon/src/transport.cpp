@@ -27,15 +27,28 @@ bool Transport::enqueueFormat(bool control, const char *format, ...) {
 }
 void Transport::serviceTx() {
   if (!tx_count) return;
+  TxRecord &r = tx[tx_head];
+#if defined(ARDUINO_UNOR4_WIFI) && defined(NO_USB)
+  // R4 WiFi Serial is a UART to the ESP32 USB bridge, not SerialUSB.
+  // Renesas 1.6.0 UART inherits Print.availableForWrite() == 0. Its write
+  // waits for the data register. Limit each service to four bytes (about
+  // 87 us of wire time at 460800 baud, 8N1), then return to acquisition,
+  // command polling and the watchdog. Never wait for a whole DATA3 row.
+  size_t sent = 0;
+  while (sent < 4 && r.offset + sent < r.size) {
+    if (Serial.write((uint8_t)r.bytes[r.offset + sent]) != 1) break;
+    ++sent;
+  }
+#else
   const int capacity = Serial.availableForWrite();
   if (capacity <= 0) return;
-  TxRecord &r = tx[tx_head];
   size_t n = r.size - r.offset;
   if (n > 64) n = 64;
   if (n > (size_t)capacity) n = capacity;
-  // Renesas 1.6.0: one writer; FIFO consumers can only free capacity.
+  // SerialUSB: one writer; FIFO consumers can only free capacity.
   // No flush, retry, or Serial boolean conversion (which calls tud_task).
   const size_t sent = Serial.write((const uint8_t *)r.bytes + r.offset, n);
+#endif
   r.offset += sent;
   if (r.offset == r.size) {
     tx_head = (tx_head + 1) % TX_COUNT;

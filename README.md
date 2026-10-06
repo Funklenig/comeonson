@@ -33,6 +33,12 @@ history and memory growth, then removes its temporary captures. It uses
 Matplotlib needs a desktop display for interactive plot windows. `--list-ports`
 lists devices. Only one program can own the board's serial port.
 
+The logger waits 2.5 seconds for USB settling, then up to 20 seconds for the
+firmware readiness handshake. Use `--ready-timeout SECONDS` to change the handshake
+wait. A timeout can also indicate the wrong port or incompatible firmware; waiting
+longer does not correct those causes. Keep the entry point named `Data_Logger.txt`:
+recording provenance hashes that filename when allocating a capture.
+
 Production defaults to 180 seconds per run. Use `--run-seconds SECONDS` to change
 it. Invalid peak configuration is reported as a CLI argument error.
 
@@ -67,6 +73,32 @@ arduino-cli upload --fqbn arduino:renesas_uno:unor4wifi --port /dev/ttyACM0 --in
 # Or upload the separately compiled calibration application:
 arduino-cli upload --fqbn arduino:renesas_uno:unor4wifi --port /dev/ttyACM0 --input-dir build/calibration
 ```
+
+### R4 WiFi readiness regression
+
+The R4 WiFi routes `Serial` through a UART to its ESP32 USB bridge. In core
+1.6.0 that UART inherits `Print.availableForWrite()`, which always returns zero.
+Earlier transport code treated zero as a full transmit buffer and consequently
+sent neither telemetry nor readiness replies. Rebuild and upload the fixed
+firmware for **both** applications as needed; increasing `--ready-timeout` or
+renaming the Python entry point cannot fix this firmware defect.
+
+The transport now writes at most four UART bytes per loop (about 87 microseconds
+of wire time at 460800 baud), allowing command, watchdog and acquisition
+processing between slices. The separate SerialUSB path retains its
+capacity checks. Native tests model both serial implementations.
+
+**Baud-rate migration:** both sketches and the logger now default to **460800**.
+The former 115200 setting carries at most 11,520 bytes/second (8N1), less than the
+DATA3 stream at 100 rows/second. Rebuild/upload the new firmware and use the
+matching logger; remove any old `--baud 115200` override. Set Arduino Serial
+Monitor to 460800 too. For intentionally retained old firmware, the logger's
+`--baud 115200` option remains available, but does not fix that firmware's
+transmit bug or provide enough bandwidth for its 100 Hz DATA3 stream.
+
+Native tests reproduce loss at 115200 and verify acknowledged, complete captures
+at 460800 with simulated UART and sensor timing for both roles. Actual USB bridge
+throughput and Windows operation still require a check on the board.
 
 ## Calibration configuration and procedure
 

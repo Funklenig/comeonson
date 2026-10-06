@@ -188,7 +188,7 @@ void setup() {
   initPresets();
   demo_sine_dac_min = DAC_REG_MIN + DEMO_SINE_MARGIN_DAC;
   demo_sine_dac_max = DAC_REG_MAX - DEMO_SINE_MARGIN_DAC;
-  Serial.begin(115200);
+  Serial.begin(460800);
   delay(2000);
   acquisition.begin();
   slot_us = phase_update_us = micros();

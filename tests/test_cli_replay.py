@@ -6,7 +6,7 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import matplotlib
 matplotlib.use('Agg')
@@ -30,6 +30,34 @@ class CliReplayTests(unittest.TestCase):
         expected = json.loads((ROOT/'tests/fixtures/production_peaks.json').read_text())
         self.assertEqual([event_record(event) for event in events], expected)
         self.assertGreater(len(events), 0)
+
+    def test_readiness_timeout_default_override_and_cleanup(self):
+        for options, timeout, baud in (([],20.0,460800),
+                                       (['--ready-timeout','45'],45.0,460800),
+                                       (['--baud','115200'],20.0,115200)):
+            with self.subTest(options=options):
+                link = Mock()
+                link.wait_until_ready.return_value = False
+                link.close.return_value = None
+                entry = runpy.run_path(str(ROOT/'Data_Logger.txt'))
+                factory = Mock(return_value=link)
+                entry['main'].__globals__['SerialLink'] = factory
+                with patch.object(sys,'argv',['logger','--port','fake']+options), \
+                     patch('time.sleep',return_value=None):
+                    with self.assertRaisesRegex(SystemExit,f'within {timeout:g} seconds'):
+                        entry['main']()
+                self.assertEqual(factory.call_args.args[:2], ('fake', baud))
+                link.wait_until_ready.assert_called_once_with(timeout)
+                link.close.assert_called_once_with()
+
+    def test_readiness_timeout_rejects_invalid_values(self):
+        for value in ('0','-1','nan','inf'):
+            with self.subTest(value=value):
+                result = subprocess.run([sys.executable,str(ROOT/'Data_Logger.txt'),
+                                         '--port','unused','--ready-timeout',value],
+                                        capture_output=True,text=True)
+                self.assertEqual(result.returncode,2)
+                self.assertIn('--ready-timeout',result.stderr)
 
     def test_bad_config_is_argparse_error(self):
         result = subprocess.run([sys.executable, str(ROOT/'Data_Logger.txt'), '--port', 'unused',
