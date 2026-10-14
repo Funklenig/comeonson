@@ -1,4 +1,6 @@
 #pragma once
+#include <stdint.h>
+constexpr uint8_t NUM_PSENS = 7;
 // A completed scan is a value: formatting cannot change acquisition state.
 struct PressureReading {
   float pressure_pa, temp_c;
@@ -13,4 +15,6 @@ struct ScanSnapshot {
   uint32_t flow_sample_us;
   PressureReading pressure[NUM_PSENS];
   char run_id[17];
+  int pot_raw_adc;
+  const char *calibration_position = "none";
 };
