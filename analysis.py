@@ -1,182 +1,50 @@
-"""Deterministic analysis shared by live capture and file replay."""
-import time
-from collections import deque
-from dataclasses import dataclass
-from recording_schema import Sample
-from peak_detection import PeakFlowDetector, PeakDetectionConfig, standard_flow, continuity_reason, PeakEvent
+"""Peak analysis for saved recordings; acquisition uses capture.py alone."""
 
-class CaptureDiscontinuity(ValueError):
-    """Owned counters regressed or repeated; capture integrity is lost."""
+from capture import (
+    CaptureSession,
+    CaptureResult as AnalysisResult,
+    BoardTimeReset,
+    CaptureDiscontinuity,
+    MillisUnwrapper,
+)
+from peak_detection import PeakFlowDetector, PeakDetectionConfig, standard_flow
 
 
-class BoardTimeReset(ValueError):
-    """Board clock discontinuity."""
-
-@dataclass
-class AnalysisResult:
-    sample: Sample
-    events: list[PeakEvent]
-
-class MillisUnwrapper:
-    """Convert the board's uint32 millis counter into monotonic seconds.
-
-    Unsigned subtraction naturally handles the roughly 49.7-day wrap. A
-    backward jump smaller than half the uint32 range is treated as a board
-    reset and starts a new segment without making plotted time go backward.
-    """
-
-    def __init__(self):
-        self.last_ms = None
-        self.elapsed_ms = 0
-        self.reset_count = 0
-
-    def update(self, ms):
-        ms &= 0xFFFFFFFF
-        reset = False
-        if self.last_ms is not None:
-            delta = (ms - self.last_ms) & 0xFFFFFFFF
-            if delta <= 0x7FFFFFFF:
-                self.elapsed_ms += delta
-            else:
-                self.reset_count += 1
-                reset = True
-        self.last_ms = ms
-        return self.elapsed_ms / 1000.0, reset
-
-class AnalysisSession:
-    MAX_BOUNDARIES = 1024
-
-    def __init__(self, avg_window=1, config=None, gas_temperature_c=None,
-                 absolute_pressure_mbar=None, *, score_peaks=True):
-        self.score_peaks = score_peaks
-        self.avg_window = max(1, avg_window)
+class AnalysisSession(CaptureSession):
+    def __init__(
+        self,
+        avg_window=1,
+        config=None,
+        gas_temperature_c=None,
+        absolute_pressure_mbar=None,
+        *,
+        score_peaks=True
+    ):
         self.config = config or PeakDetectionConfig()
-        standard_flow(1.0, gas_temperature_c, absolute_pressure_mbar)
         self.gas_temperature_c = gas_temperature_c
         self.absolute_pressure_mbar = absolute_pressure_mbar
-        self.reset()
+        self.score_peaks = score_peaks
+        standard_flow(1.0, gas_temperature_c, absolute_pressure_mbar)
+        super().__init__(avg_window, self.config.max_sample_gap_us)
 
     def reset(self, start_ms=0, start_us=0):
-        self._flow_hist = deque(maxlen=self.avg_window)
-        self.last_seq = self.last_sample = None
-        self._clock = MillisUnwrapper()
-        self._clock.update(start_ms)
-        self._last_row_us = start_us
-        self._elapsed_row_us = 0
-        self.segment_id = self.dropped_rows = self.missed_acquisition_slots = 0
-        self.firmware_tx_drops = 0
-        self.owned = False
-        self.boundaries = []
-        self.boundaries_omitted = 0
-        self._break_reason = None
+        super().reset(start_ms, start_us)
         self.detector = PeakFlowDetector(self.config)
 
-    def set_origin(self, start_ms, start_us):
-        """STARTED anchors this fresh session; statistics belong to allocation."""
-        self._clock = MillisUnwrapper()
-        self._clock.update(start_ms)
-        self._last_row_us = start_us
-        self._elapsed_row_us = 0
-        self.owned = True
-
     def break_continuity(self, reason, before_seq=None):
-        self._flow_hist.clear()
         events = self.detector.break_continuity(reason)
-        if self._break_reason == reason:
-            return events
-        self._break_reason = reason
-        self.segment_id += 1
-        if len(self.boundaries) < self.MAX_BOUNDARIES:
-            self.boundaries.append(dict(after_seq=self.last_seq, before_seq=before_seq, reason=reason))
-        else:
-            self.boundaries_omitted += 1
+        super().break_continuity(reason, before_seq)
         return events
 
     def finish(self):
         return self.detector.flush()
 
-    def push(self, w, active=True, host_unix=None):
-        previous = self.last_sample
-        if self.owned and previous is not None:
-            for field in ('seq', 'scan_id', 'missed_slots_total', 'tx_dropped_total'):
-                value, prior = w[field], getattr(previous, field)
-                if value is None or prior is None:
-                    continue
-                delta = (value-prior) & 0xffffffff
-                if delta >= 0x80000000 or (field in ('seq', 'scan_id') and delta == 0):
-                    raise CaptureDiscontinuity(field + ' repeated or regressed')
-            if w['scan_id'] is not None and previous.scan_id is not None:
-                if (w['scan_id']-previous.scan_id) & 0xffffffff != (w['seq']-previous.seq) & 0xffffffff:
-                    raise CaptureDiscontinuity('scan and sequence increments disagree')
-        elapsed_s, reset = self._clock.update(w['ms'])
-        if reset:
-            raise BoardTimeReset('millis reset')
-        if w['protocol'] >= 2:
-            delta = (w['row_us'] - self._last_row_us) & 0xffffffff
-            if delta > 0x7fffffff:
-                raise BoardTimeReset('micros reset')
-            self._elapsed_row_us += delta
-            self._last_row_us = w['row_us']
-            if active and abs(self._elapsed_row_us/1e6-elapsed_s) > .003:
-                raise BoardTimeReset('millis/micros disagree')
-            row_time_us = self._elapsed_row_us
-            flow_time_us = row_time_us-w['flow_age_us'] if w['flow_age_us'] >= 0 else row_time_us
-            t_s = flow_time_us/1e6
-        else:
-            row_time_us = int(elapsed_s*1e6)
-            flow_time_us = row_time_us-w['flow_age_us'] if w['flow_age_us'] >= 0 else row_time_us
-            t_s = flow_time_us/1e6
-        previous = self.last_sample
-        # Classify continuity before smoothing, using the same rule as the
-        # standalone detector. The detector receives only normalized segments.
-        reason = continuity_reason(previous, seq=w['seq'], scan_id=w['scan_id'],
-                                   t_s=t_s, run_id=w['run_id'],
-                                   missed_slots_total=w['missed_slots_total'],
-                                   tx_dropped_total=w['tx_dropped_total'],
-                                   flow_ok=w['flow_ok'], max_gap_us=self.config.max_sample_gap_us)
-        if previous is not None:
-            delta_seq = (w['seq'] - previous.seq) & 0xffffffff
-            if 1 < delta_seq < 0x80000000:
-                self.dropped_rows += delta_seq - 1
-        elif self.owned:
-            self.dropped_rows += w['seq']
-            if w['seq']:
-                reason = 'missing_prefix'
-        for field, counter in (('missed_slots_total', 'missed_acquisition_slots'),
-                               ('tx_dropped_total', 'firmware_tx_drops')):
-            value = w[field]
-            prior = getattr(previous, field) if previous else None
-            if value is not None:
-                delta = value if prior is None else (value-prior) & 0xffffffff
-                if prior is None or delta < 0x80000000:
-                    setattr(self, counter, getattr(self, counter) + delta)
-        events = self.break_continuity(reason, w['seq']) if reason else []
-        if reason is None:
-            self._break_reason = None
-        if w['flow_ok']:
-            self._flow_hist.append(w['flow_raw'])
-        # Divide before summing so finite extreme inputs cannot poison a
-        # running sum. The bounded window is also replayed with this order.
-        average = sum(value/len(self._flow_hist) for value in self._flow_hist) if self._flow_hist else 0.0
-        resolved = standard_flow(w['target_peak_slm'], self.gas_temperature_c, self.absolute_pressure_mbar)
-        target = w['target_peak_slm'] if resolved is None else resolved
-        sample = Sample(
-            **{key: w[key] for key in ('seq', 'ms', 'flow_raw', 'flow_ok', 'flow_age_us',
-               'pa', 'temp', 'pok', 'pa_age_us', 'cmd_dac', 'feedback_dac', 'cmd_pct',
-               'fdbk_pct', 'target_flow_slm', 'phase', 'preset', 'clamped', 'run_id',
-               'scan_id', 'row_us', 'cycle_id', 'scan_start_us', 'missed_slots_total',
-               'tx_dropped_total', 'pot_raw_adc', 'calibration_position')},
-            t_s=t_s, host_unix=time.time() if host_unix is None else host_unix,
-            flow_avg=average, target_peak_slm=target, row_time_us=row_time_us,
-            flow_time_us=flow_time_us,
-            pa_time_us=[row_time_us-a if a >= 0 else None for a in w['pa_age_us']],
-            segment_id=self.segment_id, discontinuity_reason=reason or '',
-            target_reference_resolved=resolved is not None,
-            target_peak_local_lmin=w['target_peak_slm'])
-        self.last_seq = sample.seq
-        self.last_sample = sample
+    def target_peak(self, local_peak):
+        resolved = standard_flow(local_peak, self.gas_temperature_c, self.absolute_pressure_mbar)
+        return (local_peak if resolved is None else resolved), resolved is not None
+
+    def push(self, wire, active=True, host_unix=None):
+        result = super().push(wire, active, host_unix)
         if active and self.score_peaks:
-            events.extend(self.detector.push(sample, check_continuity=False))
-        if w['flow_ok']:
-            self._break_reason = None
-        return AnalysisResult(sample, events)
+            result.events.extend(self.detector.push(result.sample, check_continuity=False))
+        return result

@@ -38,13 +38,13 @@ class RecordingWorker:
             self._drain()
         return True
 
-    def finish(self, reason, tail_truncated=False, end_ack=None):
+    def finish(self, reason, tail_truncated=False, end_ack=None, planned_duration_reached=False):
         with self._condition:
             if self.done.is_set():
                 return
             self._accepting = False
             if self._terminal is None or tail_truncated:
-                self._terminal = (reason, tail_truncated, end_ack)
+                self._terminal = (reason, tail_truncated, end_ack, planned_duration_reached)
             self._condition.notify()
         if not self.background:
             self._drain()
@@ -87,7 +87,7 @@ class RecordingWorker:
                         self.on_sample(result)
                 except Exception as exc:
                     kind = exc.kind if isinstance(exc, RecordingError) else (
-                        'storage_fault' if isinstance(exc, OSError) else 'analysis_fault')
+                        'storage_fault' if isinstance(exc, OSError) else 'capture_fault')
                     self.recording.mark_failure(kind)
                     with self._condition:
                         self._queue.clear()
@@ -95,8 +95,9 @@ class RecordingWorker:
                     if terminal:
                         result = CompletionResult(bool(self.recording.manifest.get('end_ack')), False, kind)
                     else:
-                        self.on_error(kind, exc)
-                        self.finish(kind, True)
+                        pending_stop = self.on_error(kind, exc) is False
+                        if not pending_stop:
+                            self.finish(kind, True)
                 with self._condition:
                     self._busy_since = None
                 # Commit completion and notify control under the same lock as

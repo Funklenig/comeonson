@@ -8,7 +8,7 @@
 static ActuatorIO actuator;
 static SensorState sensors;
 static Acquisition acquisition(sensors);
-static Transport transport(false);
+static Transport transport;
 static int corrected_centre_dac;
 static uint32_t slot_us = 0, phase_update_us = 0, scan_id = 0, cycle_id = 0, missed_slots_total = 0;
 static uint32_t last_monitor_ms = 0;
@@ -72,7 +72,7 @@ static void initPresets() {
 
 
 
-static int      current_preset = -1;  // -1 idle, -2 demo sine, 0-3 presets
+static int      current_preset = -1;  // -1 idle, 0-3 presets
 // VERIFY: phi_us remains float because changing it alone would still narrow through float preset periods and fmodf(); confirm its float-ULP resolution near preset 1's longest period is acceptable on the rig before making a coordinated double-precision change.
 static float    phi_us         = 0.0f;
 
@@ -118,27 +118,6 @@ static float commandedFlowSlm(float phi, int &phase_out,
          sinf(PI * (phi - p.t_exp_us) / p.t_insp_us);
 }
 
-// =============================================================================
-//  DEMO SINE — full-range motion demo, not physiologically meaningful.
-// Sweeps DAC register limits minus the margin. Actual travel depends on
-// external Jrk input scaling; firmware does not infer a mechanical limit.
-
-static const float DEMO_SINE_PERIOD_US = 3.0e6f;  // 3s/cycle
-static const int   DEMO_SINE_MARGIN_DAC = 100;     // keep a small margin off the register rails
-
-static int demo_sine_dac_min = 0;
-static int demo_sine_dac_max = 4095;
-
-static int stepDemoSine(float phi) {
-  const float half_range = (float)(demo_sine_dac_max - demo_sine_dac_min) / 2.0f;
-  const float centre     = (float)(demo_sine_dac_max + demo_sine_dac_min) / 2.0f;
-  const float pos_norm   = sinf(2.0f * PI * phi / DEMO_SINE_PERIOD_US);
-
-  const float dac_out_unclamped = centre + half_range * pos_norm;
-  return actuator.write((int)(dac_out_unclamped + 0.5f));
-}
-
-
 static void stopSession(const char *reason) {
   actuator.centre();
   current_preset = -1;
@@ -175,19 +154,12 @@ static void dispatch(char key) {
   if (key == 'B') startMotion(transport.preset);
   else if (key == 'E') stopSession("host_stop");
   else if (key == 'H' || key == 'h' || key == '0') stopSession("manual_override");
-  else if ((key >= '1' && key <= '4') || key == 's' || key == 'S') {
-    if (transport.active()) stopSession("manual_override");
-    startMotion(key == 's' || key == 'S' ? -2 : key-'1');
-  } else if (key == 'X' || key == 'x' || key == 'm' || key == 'n') {
-    transport.enqueueText("# ERROR,3,calibration_firmware_required\n");
-  }
+
 }
 void setup() {
   actuator.begin(); // hold centre before USB and I2C initialization
   corrected_centre_dac = applyDacCorrection(DAC_CENTRE);
   initPresets();
-  demo_sine_dac_min = DAC_REG_MIN + DEMO_SINE_MARGIN_DAC;
-  demo_sine_dac_max = DAC_REG_MAX - DEMO_SINE_MARGIN_DAC;
   Serial.begin(460800);
   delay(2000);
   acquisition.begin();
@@ -207,13 +179,12 @@ void loop() {
     slot_us += slots*LOG_INTERVAL_US;
     missed_slots_total += slots-1;
     if (acquisition.closeScan(completed, closure_phase, closure_cycle)) publish(completed);
-    if (current_preset != -1) {
-      const float period = current_preset == -2 ? DEMO_SINE_PERIOD_US : presets[current_preset].period_us;
+    if (current_preset >= 0) {
+      const float period = presets[current_preset].period_us;
       const float total = phi_us + (float)(uint32_t)(now-phase_update_us);
       cycle_id += (uint32_t)(total/period);
       phi_us = fmodf(total, period);
-      if (current_preset == -2) stepDemoSine(phi_us);
-      else stepDac(phi_us);
+      stepDac(phi_us);
     }
     phase_update_us = now;
     actuator.sample();

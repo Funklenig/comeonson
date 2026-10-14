@@ -20,9 +20,9 @@ from serial_link import SerialLink
 from test_recording import FakeSerial
 
 
-def smoke(calibration):
+def smoke():
     with tempfile.TemporaryDirectory() as directory:
-        fake = FakeSerial(role='calibration' if calibration else 'production')
+        fake = FakeSerial()
         link = SerialLink(None,115200,1,serial_instance=fake,run_seconds=None,
                           recording_directory=directory)
         entry = runpy.run_path(str(ROOT/'Data_Logger.txt'))
@@ -30,7 +30,7 @@ def smoke(calibration):
         original_show = plt.show
         failures = []
         timers = []
-        keys = iter('HXmntHq' if calibration else ('1','H','2','p','s','H','q'))
+        keys = iter(('1','H','2','p','3','H','4','H','q'))
         def show():
             assert len(plt.get_fignums()) == 3
             canvas = plt.figure(1).canvas
@@ -38,7 +38,7 @@ def smoke(calibration):
                 try:
                     if link.state == 'RUNNING':
                         preset = link.recording.manifest['preset']
-                        fake.sample(preset=preset, position='centre' if calibration else 'none')
+                        fake.sample(preset=preset, position='none')
                     key = next(keys, 'q')
                     if key == 'q':
                         timer.stop()
@@ -55,7 +55,7 @@ def smoke(calibration):
             timers.append(timer)
             timer.start()
             original_show(block=True)
-        argv = ['Data_Logger.txt','--port','synthetic'] + (['--calibration'] if calibration else [])
+        argv = ['Data_Logger.txt','--port','synthetic']
         try:
             with patch.object(sys,'argv',argv), patch('matplotlib.pyplot.show',side_effect=show):
                 entry['main']()
@@ -63,13 +63,12 @@ def smoke(calibration):
                 raise failures[0]
             assert fake.closed and link.worker.join(0)
             assert link.last_result.recording_complete
-            assert len(list(Path(directory).glob('*_session.json'))) == (1 if calibration else 2)
+            assert len(list(Path(directory).glob('*_session.json'))) == 3
         finally:
             plt.close('all')
             link.close()
-    print(('Calibration' if calibration else 'Production') + ' Tk GUI smoke passed')
+    print('Four-preset Tk GUI smoke passed')
 
 
 if __name__ == '__main__':
-    smoke(False)
-    smoke(True)
+    smoke()

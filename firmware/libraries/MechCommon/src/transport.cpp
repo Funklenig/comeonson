@@ -1,4 +1,5 @@
 #include "transport.h"
+#include "stop_marker.h"
 #include "telemetry.h"
 #include "actuator_io.h"
 #include <stdio.h>
@@ -82,9 +83,12 @@ void Transport::endSession(const char *reason) {
   host_watchdog_armed = false;
   if (!run_id[0]) return;
   strcpy(ended_id, run_id);
-  if (completed_count < COMPLETED_CAPACITY) strcpy(completed_ids[completed_count++], run_id);
-  snprintf(ended_marker, sizeof ended_marker, "# ENDED,3,%s,%lld,%s,%lu\n", run_id,
-           (long long)final_enqueued_seq, reason, (unsigned long)tx_dropped_total);
+  // Bounded replay protection for recent commands; completed sessions never
+  // exhaust the board's ability to accept the next experiment.
+  strcpy(completed_ids[completed_next], run_id);
+  completed_next = (completed_next + 1) % COMPLETED_CAPACITY;
+  if (completed_count < COMPLETED_CAPACITY) ++completed_count;
+  encodeEnded(ended_marker, sizeof ended_marker, run_id, final_enqueued_seq, reason, tx_dropped_total);
   enqueueText(ended_marker, true);
   run_id[0] = 0;
 }
@@ -109,8 +113,7 @@ char Transport::handleFrame(char *line) {
     else if (!strcmp(ended_id, first) && tx_count < TX_COUNT - 1)
       enqueueText(ended_marker, true);
   } else if (!strcmp(line, "@START") && mode) {
-    const int selected = calibration ? (!strcmp(mode, "CAL") ? -3 : -1) : !strcmp(mode, "DEMO") ? -2
-                                             : (strlen(mode) == 2 && mode[0] == 'P' &&
+    const int selected = (strlen(mode) == 2 && mode[0] == 'P' &&
                                                         mode[1] >= '0' && mode[1] <= '3'
                                                     ? mode[1] - '0'
                                                     : -1);
@@ -118,10 +121,6 @@ char Transport::handleFrame(char *line) {
     if (run_id[0]) {
       if (!strcmp(run_id, first) && !strcmp(run_mode, mode) && tx_count < TX_COUNT - 1)
         enqueueText(started_marker, true);
-      return 0;
-    }
-    if (completed_count == COMPLETED_CAPACITY) {
-      enqueueText("# ERROR,3,completed_id_capacity_reset_required\n");
       return 0;
     }
     // Reserve STARTED plus a future ENDED before any motion.
@@ -189,7 +188,7 @@ bool Transport::serviceMeta() {
       ok = enqueueFormat(false, "# META,3,pot_dac_per_adc,%.8g\n", POT_DAC_COUNTS_PER_ADC);
       break;
     case 12:
-      ok = enqueueFormat(false, "# META,3,firmware_role,%s\n", calibration ? "calibration" : "production");
+      ok = enqueueFormat(false, "# META,3,firmware_role,%s\n", "production");
       break;
     case 13:
       ok = enqueueFormat(false, "# META,3,slot_us,%lu\n", (unsigned long)LOG_INTERVAL_US);

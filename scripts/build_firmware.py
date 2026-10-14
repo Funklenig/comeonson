@@ -15,7 +15,7 @@ FQBN = CORE + ':unor4wifi'
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('sketch', choices=('MechLung', 'calibration'))
+    parser.add_argument('sketch', choices=('MechLung',))
     parser.add_argument('--cli', default='arduino-cli')
     args = parser.parse_args()
     platforms = json.loads(subprocess.check_output([args.cli, 'core', 'list', '--format', 'json']))

@@ -138,24 +138,7 @@ def interpolate_peak(times, values):
     return dt, y0 + b*dt + a*dt*dt, 'interpolated'
 
 
-def continuity_reason(previous, *, seq, scan_id, t_s, run_id,
-                      missed_slots_total, tx_dropped_total, flow_ok, max_gap_us):
-    """One continuity policy for normalization and standalone detection."""
-    if not flow_ok:
-        return 'invalid_flow'
-    if previous is None:
-        return None
-    if (seq - previous.seq) & 0xffffffff != 1:
-        return 'sequence_discontinuity'
-    if scan_id is not None and previous.scan_id is not None and (scan_id - previous.scan_id) & 0xffffffff != 1:
-        return 'scan_discontinuity'
-    if not 0 < (t_s - previous.t_s) * 1e6 <= max_gap_us:
-        return 'flow_time_discontinuity'
-    if run_id != previous.run_id:
-        return 'run_discontinuity'
-    if missed_slots_total != previous.missed_slots_total or tx_dropped_total != previous.tx_dropped_total:
-        return 'firmware_loss'
-    return None
+from capture import continuity_reason
 
 
 class PeakEvent(TypedDict):

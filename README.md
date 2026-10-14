@@ -1,238 +1,205 @@
-# Mechanical lung logger and firmware
+# Mechanical lung logger
 
-One Python logger supports production breathing runs and interactive calibration
-captures. Two independently compiled sketches share actuator I/O, sensor
-acquisition, bounded serial transport and a protocol-3 encoder.
+Use the matching Python logger and **Arduino UNO R4 WiFi** production firmware.
+Select a flow preset (10, 15, 20 or 30 L/min), monitor the three live plots, and
+save the timed experiment. Runs default to 180 seconds; `--run-seconds` changes
+that duration. Presets can be repeated without restarting the logger or board.
+Calibration and sine-demo execution paths and old recording formats are removed.
+Physical geometry, sensor scaling and actuator feedback constants remain in
+`firmware/libraries/MechCommon/src/calibration_values.h`.
 
-## Python setup and tests
+## Python setup
 
-Python 3.9 or newer is required. From the repository root:
+Python 3.9 or newer:
 
 ```sh
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python -m unittest discover -s tests -v
 .venv/bin/python Data_Logger.txt --port /dev/ttyACM0
 ```
 
-The full test suite also requires `g++` (C++17) for the synthetic firmware harness.
-Additional software acceptance checks (no board or serial port required):
+Use `--list-ports` to find the board. The logger and firmware default to **460800
+baud**. The DATA3 stream at 100 Hz exceeds the capacity of 115200 baud; remove
+old baud overrides. Only one program can own the serial port.
+
+Opening the port is followed by 2.5 seconds of USB settling and a validated
+production-firmware handshake, with a 20-second timeout. `--ready-timeout` adjusts
+that wait. Calibration and legacy firmware do not satisfy readiness.
+
+### Controls
+
+Click a plot window first.
+
+| Key | Action |
+| --- | --- |
+| `1`–`4` | Start the corresponding preset and recording |
+| `H`, `h`, `0` | Stop and keep measurements; hold centre |
+| `p` | Stop and discard this run's files |
+| `t`, `T` | Toggle board monitor text |
+| `?` | Retry readiness negotiation when idle or after a recovered storage fault |
+| `q` | Stop, finalize measurements and close the plots |
+
+Flow, actuator command/feedback and seven pressures are plotted independently.
+Invalid sensor readings appear as gaps; valid channels continue to plot. The
+status distinguishes recording state, saving, stop confirmation, data quality
+and analysis. File-write or connection failures end the run and attempt an
+explicit owned STOP. If its acknowledgement is unavailable, stop remains
+unconfirmed. The firmware heartbeat watchdog remains a fallback.
+
+## Saved measurements and analysis
+
+Each run reserves only:
+
+- `preset_N_TIMESTAMP.csv`: received measurements, original wire lines,
+  timestamps, validity/age information and explicit `missing_before` sequence gaps.
+- `preset_N_TIMESTAMP_session.json`: firmware/software identity and separate
+  run, storage, stop and quality outcomes.
+
+Measurements are saved by a bounded FIFO worker. Invalid sensors, malformed rows,
+corrupt measurement counters and missing samples affect quality and diagnostics;
+they do not terminate a connected recording with healthy storage. Corrupt rows
+are rejected without replacing the last trustworthy timestamp. Received valid
+rows remain available. No placeholder measurements are synthesized for gaps.
+
+The summary's `complete` describes successful capture finalization;
+`storage_complete` describes successful saving; `quality_complete` describes
+measurement validity and loss. `planned_duration_reached`, `stop_confirmed`,
+`termination_reason` and `failure_reason` describe the run separately. A run with
+gaps can complete its planned duration and start the next preset normally.
+
+`missing_rows`, `missed_acquisition_slots`, `firmware_tx_drops` and `invalid_rows`
+are independent diagnostics that may overlap. **Do not sum them.** Invalid-flow
+and per-pressure-channel counts identify sensor faults separately. The boundary
+list is capped at 1,024 details; the summary reports omitted details, while CSV
+rows retain their segment and gap information.
+
+After capture finalizes, a separate process reads the saved CSV and produces:
+
+- `preset_N_TIMESTAMP_peaks.csv`: peak results using the established rules.
+- `preset_N_TIMESTAMP_analysis.json`: analysis outcome, policy, source digest,
+  peak populations, commanded-phase summaries and orientation diagnostics.
+
+Analysis never executes on the capture worker, allocates files before START, or
+changes the measurement CSV/run summary. Invalid peak configuration and analysis
+output failures are reported independently. Automatic analysis uses one process
+and a bounded queue of four pending runs. If work is deferred or interrupted
+while closing the logger, the measurements remain usable; retry the saved run.
+A missing analysis result file means analysis has not been published successfully.
+
+Retry without a board or live GUI:
 
 ```sh
-xvfb-run -a .venv/bin/python scripts/smoke_gui.py
-.venv/bin/python scripts/soak_capture.py
+.venv/bin/python analysis_runner.py recordings/preset_1_TIMESTAMP_session.json
 ```
 
-The GUI smoke uses the real Tk backend, all three plot windows, keyboard callbacks,
-and a synthetic serial board for both roles. Linux needs Tk and Xvfb; on Amazon
-Linux install missing packages with `sudo dnf install python3-tkinter xorg-x11-server-Xvfb xorg-x11-xauth`.
-On a desktop with a display, omit `xvfb-run -a`. The soak writes 180,000 synthetic
-rows per role (30 simulated minutes each), checks manifests, peaks, bounded plot
-history and memory growth, then removes its temporary captures. It uses
-`tracemalloc`, so runtime is longer than an ordinary replay.
-Matplotlib needs a desktop display for interactive plot windows. `--list-ports`
-lists devices. Only one program can own the board's serial port.
+To override analysis settings on retry, use `--options settings.json`. For example:
 
-The logger waits 2.5 seconds for USB settling, then up to 20 seconds for the
-firmware readiness handshake. Use `--ready-timeout SECONDS` to change the handshake
-wait. A timeout can also indicate the wrong port or incompatible firmware; waiting
-longer does not correct those causes. Keep the entry point named `Data_Logger.txt`:
-recording provenance hashes that filename when allocating a capture.
+```json
+{"config": {"smooth_window": 1, "min_samples": 3}, "avg_window": 1,
+ "gas_temperature_c": 20, "absolute_pressure_mbar": 1013}
+```
 
-Production defaults to 180 seconds per run. Use `--run-seconds SECONDS` to change
-it. Invalid peak configuration is reported as a CLI argument error.
+A `config` override replaces the saved detector configuration; omitted settings
+use detector defaults. Otherwise the saved options are used. The existing peak
+rules are preserved; this change does not establish their scientific suitability.
+`--peak-*`, `--warmup-breaths` and flow-reference settings on the logger are passed
+to analysis after capture. Detector limit validation happens then.
 
-## Arduino builds
+## Firmware build
 
-Compile target: **Arduino UNO R4 WiFi**, FQBN `arduino:renesas_uno:unor4wifi`,
-Renesas UNO core **1.6.0**. This target matches the original source's Wire1/Qwiic
-bus and the core's SDA1/SCL1 definitions (27/26). It is a verified compile target;
-the physical rig model still needs confirmation before upload. The R4 Minima
-is not an interchangeable target for this two-bus wiring.
-
-Using Arduino CLI 1.2.2:
+Use **Arduino CLI 1.2.2**, Renesas UNO core **1.6.0**, FQBN
+`arduino:renesas_uno:unor4wifi`:
 
 ```sh
 arduino-cli core update-index
 arduino-cli core install arduino:renesas_uno@1.6.0
 python3 scripts/build_firmware.py MechLung
-python3 scripts/build_firmware.py calibration
 ```
 
-These are two independent compile commands. Each passes `--libraries
-firmware/libraries` and supplies a digest of the firmware sources and build
-procedure, plus core/board identity, through a temporary provenance header.
-Outputs go into `build/MechLung` and `build/calibration`. The script refuses a
-different installed core version. Pass `--cli /path/to/arduino-cli` if needed.
-No build command uploads or moves hardware.
-
-After confirming the actual board and configuration, upload **one** target:
+The build script checks the core version, uses `firmware/libraries`, adds source
+provenance and writes `build/MechLung`. It does not upload. To upload the matching
+production build to the connected board:
 
 ```sh
 arduino-cli upload --fqbn arduino:renesas_uno:unor4wifi --port /dev/ttyACM0 --input-dir build/MechLung
-# Or upload the separately compiled calibration application:
-arduino-cli upload --fqbn arduino:renesas_uno:unor4wifi --port /dev/ttyACM0 --input-dir build/calibration
 ```
 
-### R4 WiFi readiness regression
+The R4 WiFi UART returns zero from `availableForWrite()` in this core. Transport
+writes at most four bytes per service call so acquisition, command handling and
+the watchdog continue. ENDED formatting uses decimal sequence text because this
+target's `newlib-nano` does not support `%lld`. The firmware remembers 64 recent
+completed IDs to reject retransmitted START commands, using a rolling cache;
+there is no 64-run reset requirement. IDs older than this cache are not retained.
 
-The R4 WiFi routes `Serial` through a UART to its ESP32 USB bridge. In core
-1.6.0 that UART inherits `Print.availableForWrite()`, which always returns zero.
-Earlier transport code treated zero as a full transmit buffer and consequently
-sent neither telemetry nor readiness replies. Rebuild and upload the fixed
-firmware for **both** applications as needed; increasing `--ready-timeout` or
-renaming the Python entry point cannot fix this firmware defect.
+## Software checks
 
-The transport now writes at most four UART bytes per loop (about 87 microseconds
-of wire time at 460800 baud), allowing command, watchdog and acquisition
-processing between slices. The separate SerialUSB path retains its
-capacity checks. Native tests model both serial implementations.
+The unittest suite needs `g++` with C++17 for the synthetic firmware harness:
 
-**Baud-rate migration:** both sketches and the logger now default to **460800**.
-The former 115200 setting carries at most 11,520 bytes/second (8N1), less than the
-DATA3 stream at 100 rows/second. Rebuild/upload the new firmware and use the
-matching logger; remove any old `--baud 115200` override. Set Arduino Serial
-Monitor to 460800 too. For intentionally retained old firmware, the logger's
-`--baud 115200` option remains available, but does not fix that firmware's
-transmit bug or provide enough bandwidth for its 100 Hz DATA3 stream.
+```sh
+.venv/bin/python -m unittest discover -s tests -v
+xvfb-run -a .venv/bin/python scripts/smoke_gui.py
+.venv/bin/python scripts/soak_capture.py
+```
 
-Native tests reproduce loss at 115200 and verify acknowledged, complete captures
-at 460800 with simulated UART and sensor timing for both roles. Actual USB bridge
-throughput and Windows operation still require a check on the board.
+Linux GUI testing needs Tk, Xvfb and xauth. On Amazon Linux:
 
-## Calibration configuration and procedure
+```sh
+sudo dnf install python3-tkinter xorg-x11-server-Xvfb xorg-x11-xauth
+```
 
-`firmware/libraries/MechCommon/src/calibration_values.h` is the single source
-for inherited centre, correction and feedback scaling, and configured endpoints.
-**CAL_MIN_DAC and CAL_MAX_DAC are deliberately unset (`-1`)**. They mean applied
-DAC commands for configured travel endpoints; they are not inferred from the
-register limits, half-range or demo margin. Set explicit rig values within
-0–4095, rebuild, and confirm the Jrk travel configuration before physical testing.
-Unset endpoint commands are rejected by both logger and firmware. The synthetic
-tests use temporary values 1200/1800; these are not rig recommendations.
+On a desktop display, omit `xvfb-run -a`. The smoke exercises all four preset keys,
+stopping, discarding, plot redraws and shutdown with synthetic serial input.
+The soak saves and independently counts 180,000 rows twice (30 simulated minutes
+per case), checks bounded memory/display history and analyzes saved files. One
+case includes persistent sensor faults. Temporary captures are deleted afterward.
 
-The existing centre/reference scaling is provisional. Calibration never fits,
-rewrites or persists configuration automatically. Suggested measurement workflow:
+Target-library regression (independent of the native host C library):
 
-1. Upload calibration firmware. It boots into centre hold and continuously
-   reports raw A1 ADC, scaled feedback, applied DAC and sensor validity/ages.
-2. Start `.venv/bin/python Data_Logger.txt --port PORT --calibration`.
-   This negotiates the calibration role and starts one acknowledged `CAL` session.
-   There is **no default duration limit**; an explicit `--run-seconds` still works.
-3. Record centre (`H`), second reference (`X`), and, once configured, maximum
-   (`m`) and minimum (`n`), then centre (`H`). Allow settling and measure actual
-   piston travel at each target. Raw A1 is shown in the actuator status and CSV.
-4. Use `q` to close and keep the capture, or `p` to stop and discard it. STOP,
-   normal close and the heartbeat watchdog return the firmware to centre.
-5. Compare measured DAC/ADC pairs and travel; update explicit configuration
-   after evaluating the measurements. Rebuild both applications as needed.
+```sh
+python3 -m venv /tmp/logger-formatter-tools
+/tmp/logger-formatter-tools/bin/python -m pip install unicorn==2.1.4 pyelftools==0.32
+/tmp/logger-formatter-tools/bin/python scripts/check_stop_formatter.py --gcc /path/to/arm-none-eabi-gcc
+```
 
-The raw sample is unfiltered; scaled feedback retains the inherited median-of-3
-filter. Position changes preserve run ID, clock and sequence. An in-progress
-old-target scan is closed before applying a new target. CAL has preset `-3`,
-phase `-1`, zero breathing targets and no breathing peak population.
+Use the ARM GCC installed with the pinned Arduino core. The probe executes actual
+linked Cortex-M4 formatter code under Unicorn and checks `-1`, `0`, `42` and the
+maximum uint32 sequence. It also checks an independent control. It does not
+emulate board peripherals or establish physical stopping.
 
-## Controls
+## Windows 10 rig procedure
 
-Click a plot before pressing keys. Firmware role is negotiated before recording.
+With Python 3.9+ and Arduino CLI 1.2.2 installed, run in PowerShell from the repo:
 
-| Key | Production | Calibration |
-| --- | --- | --- |
-| `1`–`4` | Start preset and timed recording | Rejected |
-| `s` / `S` | Demo sine recording | Rejected |
-| `H` / `h` / `0` | Stop owned run and hold centre | Centre target; keep recording |
-| `X` / `x` | Requires calibration firmware | Second reference target |
-| `m` / `n` | Requires calibration firmware | Configured max / min target |
-| `t` / `T` | Toggle monitor text | Toggle monitor text |
-| `?` | Readiness/configuration handshake when idle | Same |
-| `p` | Stop and discard run | Same |
-| `q` | Close windows, stop and finalize | Same |
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+arduino-cli core update-index
+arduino-cli core install arduino:renesas_uno@1.6.0
+.\.venv\Scripts\python.exe scripts\build_firmware.py MechLung
+arduino-cli board list
+arduino-cli upload --fqbn arduino:renesas_uno:unor4wifi --port COM5 --input-dir build/MechLung
+.\.venv\Scripts\python.exe Data_Logger.txt --list-ports
+.\.venv\Scripts\python.exe Data_Logger.txt --port COM5 --run-seconds 180
+```
 
-`m`/`M` are no longer monitor aliases. The logger refuses new monitor/endpoint
-commands on older firmware. Legacy DATA and DATA2 parsers remain available;
-protocol 2 owned production recordings are still supported. Endpoint commands
-are only sent after a protocol-3 CAL acknowledgement.
+Replace `COM5` with the board's actual port; close Arduino Serial Monitor first.
+To run the native unittest harness on Windows, install a C++17 `g++` toolchain
+and put it on PATH. GUI smoke uses Python directly on a Windows desktop.
 
-## Protocol and ownership
+For physical acceptance:
 
-Protocol 3 uses the DATA2 order followed by `pot_raw_adc` (12-bit integer) and
-`calibration_position` (`none`, `centre`, `reference`, `max`, `min`): **46 fields
-including DATA3**. Production labels are `none`. Unowned monitoring uses `-`
-as run ID, normalized to `None`; owned rows must match the acknowledged ID and
-preset. Older rows fill the added fields with `None`.
+1. Run every preset for 180 seconds, then repeat presets in the same logger.
+   Verify the physical stop/centre behavior and timestamp/command scaling.
+2. Independently count CSV rows and compare sequences, scan IDs and timestamps
+   with the board's 10 ms acquisition schedule. Investigate every unexplained gap.
+   Assess actual USB bridge throughput and all seven sensor validity/age fields.
+3. Exercise invalid sensors and recover them: unaffected channels continue,
+   measurements stay available, and quality flags identify the fault/gap.
+4. Exercise connection loss and storage failure: verify the physical stop outcome
+   and retained partial data against the reported stop/storage status.
+5. Block a derived peak output or use invalid detector settings; verify the CSV
+   survives and retry analysis successfully on the same saved run.
 
-Metadata retains geometry, correction, sensor/reference and core information.
-Version 3 replaces `calibration_target` with `firmware_role`, `cal_centre_dac`,
-`cal_reference_dac`, `cal_min_dac`, and `cal_max_dac`. Unconfigured endpoints are
-`unset`. STARTED/ENDED and manifest protocol versions are validated explicitly.
-
-Each run gets a fresh Recording, AnalysisSession and bounded worker. SerialLink
-owns transitions: IDLE → STARTING → RUNNING → STOPPING → FINALIZING → IDLE;
-failed outcomes go to FAULTED. ENDED confirms the firmware stop; storage completion
-separately determines recording success. CompletionResult exposes
-`stop_confirmed`, `recording_complete`, and `failure_reason`. A new handshake
-allows recovery after a fault once the worker exits. Old-run callbacks are ignored.
-
-The worker drains ordered samples before finalization. A requested stop has
-separate acknowledgement and storage-finalization deadlines (two seconds each by
-default); `close(timeout=...)` caps the entire shutdown. The reader uses the
-finalization deadline after ENDED rather than the shorter capture-latency limit. It is joined on close,
-including faulted runs. A shutdown deadline with blocked storage raises
-`IncompleteShutdownError`; the non-daemon worker remains alive until storage
-recovers. Python cannot safely kill a thread blocked in filesystem I/O.
-
-## Recording integrity and analysis
-
-Recordings contain sample CSV, peak CSV and a session JSON manifest. The initial
-manifest stays incomplete until final publication succeeds. CSV fields include
-original wire lines, normalized times, raw A1 and target labels. The manifest
-contains firmware identity/configuration, analysis policy and software hashes.
-
-Loss diagnostics are **separate and may overlap**:
-
-- `missing_rows`: leading and interior sequence gaps, using the owned zero origin.
-- `missed_acquisition_slots`: scheduler counter, including its initial value.
-- `firmware_tx_drops`: transmit counter and final ENDED count.
-- `invalid_rows`: malformed input rows.
-
-These diagnostics are not summed. Any known capture loss, failed storage,
-unconfirmed end or missing tail makes `complete` false. Invalid sensor readings
-remain present with validity flags and ages; they affect peak quality separately
-from missing recording data. Sequence/counter wrap uses unsigned arithmetic.
-Peak scoring for production retains the existing smoothing/segmentation policy.
-A discontinuity clears the latched threshold before the detector can rearm.
-Repeated invalid-flow/malformed-input notifications without a valid sample between
-them share a diagnostic boundary; every discontinuity still resets detection.
-The manifest retains at most 1,024 boundary details and reports additional ones
-in `boundaries_omitted`. CSV rows retain their segment IDs and discontinuity reasons.
-The detector caps an excursion at 60,000 samples (ten minutes at 100 Hz), closes
-it as partial with `excursion_limit`, and waits for a new baseline. These bounds
-are included in the additive `analysis_limits` manifest field. Phase summaries
-use constant memory and account for cycle rollover.
-
-Duplicate/backward row counters, inconsistent scan/sequence increments, regressing
-loss counters, or regressing commanded phases fault the capture explicitly.
-A manifest cannot be complete without STARTED and a consistent ENDED. Finite
-pressure extremes cannot overflow the variance calculation; nonfinite reference
-conversions and invalid numeric handshake metadata are rejected.
-
-## Acceptance status and limitations
-
-Automated checks cover repeated-run isolation, leading/slot loss, schema
-compatibility, concurrent stop/fault handling, blocked storage and injected
-analysis/flush/manifest failures. The native harness runs both actual sketches
-against simulated hardware and exercises calibration capture through the logger,
-continuous production hold, watchdog centre commands and command negotiation.
-Arduino compilation checks target compatibility separately. The expanded harness
-covers valid flow and all seven pressure channels, CRC errors, short reads, NACKs,
-nonpositive pressure scales, recovery, clock rollover, delayed I2C, partial serial
-writes and blocked output. It exercises all production presets, demo mode,
-configured and unset calibration endpoints, duplicate/stale commands, and the
-64-completed-session limit. The board must be reset after 64 completed owned
-sessions; a new host handshake alone does not clear that firmware limit.
-
-**Physical acceptance is pending:** confirm the board, configure measured
-endpoints, measure travel and DAC/ADC scaling, and test watchdog return to centre
-on the rig. Synthetic GPIO/I2C/USB tests cannot establish mechanical behavior,
-real sensor timing, USB throughput or travel safety. No physical device was
-attached during implementation.
+**Windows and physical acceptance are pending.** The sandbox has no attached rig
+or Windows environment. Compilation and synthetic tests establish software
+behavior; real sensor timing, motion, USB delivery and scaling still need the rig.

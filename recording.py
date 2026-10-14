@@ -1,343 +1,312 @@
-"""Single-owner recording storage and provenance, independent of serial/UI."""
+"""Single-owner measurement saving. Analysis never runs during capture."""
+
 import csv
+from dataclasses import dataclass
 import hashlib
 import json
 import os
-import time
-import traceback
-from dataclasses import asdict, dataclass
 from pathlib import Path
-from analysis import AnalysisSession, BoardTimeReset, CaptureDiscontinuity
-from recording_schema import (SAMPLE_COLUMNS, PEAK_COLUMNS, SOFTWARE_FILES,
-                              config_fingerprint, sample_record, event_record)
+import time
+from capture import CaptureSession, CaptureDiscontinuity, BoardTimeReset
+from recording_schema import SAMPLE_COLUMNS, sample_record, SOFTWARE_FILES
 
 SCRIPT_DIR = str(Path(__file__).resolve().parent)
-RECORDINGS_DIR = os.path.join(SCRIPT_DIR, 'recordings')
-PRESET_NAMES = {-3: 'calibration', -2: 'demo-sine', -1: 'idle/hold', 0: 'preset 1',
-                1: 'preset 2', 2: 'preset 3', 3: 'preset 4'}
-POPULATIONS = ('count', 'discarded', 'target_passes', 'target_misses',
-               'partial_excursions', 'warmup_peaks', 'reference_unresolved',
-               'pressure_incomplete', 'timing_failures', 'qualified_peaks',
-               'unqualified_peaks')
+RECORDINGS_DIR = os.path.join(SCRIPT_DIR, "recordings")
+PRESET_NAMES = {-1: "idle/hold", 0: "preset 1", 1: "preset 2", 2: "preset 3", 3: "preset 4"}
+
 
 @dataclass(frozen=True)
 class CompletionResult:
     stop_confirmed: bool
     recording_complete: bool
     failure_reason: object = None
+    quality_complete: bool = True
+    planned_duration_reached: bool = False
+    storage_complete: bool = True
 
 
 class RecordingError(Exception):
     def __init__(self, kind, cause):
         super().__init__(str(cause))
-        self.kind = kind
-        self.cause = cause
+        self.kind, self.cause = kind, cause
 
-def open_unique_csv_pair(directory, base):
-    """Create two recording files without ever truncating an old session."""
-    os.makedirs(directory, exist_ok=True)
-    for index in range(10000):
-        suffix = "" if index == 0 else f"_{index:02d}"
-        data_path = os.path.join(directory, base + suffix + ".csv")
-        peak_path = os.path.join(directory, base + suffix + "_peaks.csv")
-        data_file = None
-        try:
-            data_file = open(data_path, "x", newline="")
-            try:
-                peak_file = open(peak_path, "x", newline="")
-            except FileExistsError:
-                data_file.close()
-                os.unlink(data_path)
-                continue
-            except Exception:
-                data_file.close()
-                os.unlink(data_path)
-                raise
-            return data_path, peak_path, data_file, peak_file
-        except FileExistsError:
-            continue
-    raise OSError("could not allocate a unique recording filename")
 
-def open_unique_session(directory, base):
-    """Reserve all three related paths; clean up only paths this attempt owns."""
-    os.makedirs(directory, exist_ok=True)
-    for index in range(10000):
-        name = base + (f'_{index:02d}' if index else '')
-        paths = [os.path.join(directory, name + suffix) for suffix in ('.csv', '_peaks.csv', '_session.json')]
-        files = []
-        try:
-            for path in paths:
-                files.append(open(path, 'x', newline=''))
-            return paths, files
-        except Exception as exc:
-            for path, stream in zip(paths, files):
-                stream.close()
-                os.unlink(path)
-            if not isinstance(exc, FileExistsError):
-                raise
-    raise OSError('could not allocate unique recording names')
+def save_json(path, value):
+    """Publish one JSON file atomically; clean up only this writer's temporary."""
+    import tempfile
+
+    path = Path(path)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", dir=path.parent, prefix=path.name + ".", suffix=".tmp", delete=False
+        ) as stream:
+            temporary = Path(stream.name)
+            json.dump(value, stream, indent=2, allow_nan=False)
+            stream.write("\n")
+            stream.flush()
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
 
 class Recording:
-    """All methods run on the recording owner, except allocation before START."""
-    def __init__(self, avg_window=1, config=None, gas_temperature_c=None,
-                 absolute_pressure_mbar=None, expected_expiration_sign=None,
-                 directory=None, *, score_peaks=True):
-        self.analysis = AnalysisSession(avg_window, config, gas_temperature_c, absolute_pressure_mbar, score_peaks=score_peaks)
-        self.expected_expiration_sign = expected_expiration_sign
-        self.directory = directory
-        self._record_file = self._peak_file = None
-        self._record_writer = self._peak_writer = None
-        self._record_path = self._peak_path = self._manifest_path = None
+    def __init__(
+        self,
+        avg_window=1,
+        config=None,
+        gas_temperature_c=None,
+        absolute_pressure_mbar=None,
+        expected_expiration_sign=None,
+        directory=None,
+        *,
+        analysis_options=None,
+    ):
+        self.tracker = CaptureSession(avg_window)
+        self.directory = directory or RECORDINGS_DIR
+        # Store requested analysis settings without loading or validating a detector.
+        from dataclasses import asdict
+
+        self.analysis_options = analysis_options or dict(
+            config=asdict(config) if config is not None else {},
+            avg_window=avg_window,
+            gas_temperature_c=gas_temperature_c,
+            absolute_pressure_mbar=absolute_pressure_mbar,
+            expected_expiration_sign=expected_expiration_sign,
+        )
+        try:
+            json.dumps(self.analysis_options, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            self.analysis_options = dict(configuration_error=str(exc))
+        self._record_file = self._record_writer = None
+        self._record_path = self._manifest_path = None
         self.manifest = None
         self.started = self.failed = False
         self.failure_reason = None
-        self.rows = self.bad_lines = self.orientation_mismatches = 0
-        self._phase_first = self._phase_last = None
-        self._completed_phase_count = 0
-        self._last_completed_phase = None
-        self._first_phase_complete = False
+        self.storage_failed = False
+        self.last_saved_seq = None
+        self.rows = self.bad_lines = 0
+        self.invalid_flow_rows = 0
+        self.invalid_pressure_rows = [0] * 7
 
     @property
     def paths(self):
-        return self._record_path, self._peak_path, self._manifest_path
+        # Measurement CSV and run summary; analysis owns all derived paths.
+        return self._record_path, self._manifest_path
 
     def allocate(self, run_id, mode, preset, metadata):
         if self._record_file is not None:
+            return self.paths
+        if preset not in range(4):
             return None
-        base = f"{PRESET_NAMES.get(preset, 'unknown').replace('/', '-').replace(' ', '_')}_{time.strftime('%Y%m%d_%H%M%S')}"
-        paths, files = (), ()
+        os.makedirs(self.directory, exist_ok=True)
+        base = f'preset_{preset+1}_{time.strftime("%Y%m%d_%H%M%S")}'
+        owned = []
         try:
-            paths, files = open_unique_session(self.directory or RECORDINGS_DIR, base)
-            self._record_path, self._peak_path, self._manifest_path = paths
-            self._record_file, self._peak_file, manifest_file = files
-            manifest_file.close()
-            self._record_writer = csv.DictWriter(self._record_file, fieldnames=SAMPLE_COLUMNS)
-            self._peak_writer = csv.DictWriter(self._peak_file, fieldnames=PEAK_COLUMNS)
-            self._record_writer.writeheader()
-            self._peak_writer.writeheader()
-            a = self.analysis
-            self.manifest = dict(
-                protocol_version=3 if metadata.get('firmware_role') else 2, sample_schema=3, peak_schema=2,
-                analysis_policy='calibration' if mode == 'CAL' else 2,
-                analysis_limits=dict(max_boundaries=a.MAX_BOUNDARIES,
-                                     max_excursion_samples=a.detector.MAX_EXCURSION_SAMPLES),
-                run_id=run_id, mode=mode, preset=preset,
-                detector_config=asdict(a.config), avg_window=a.avg_window,
-                expected_expiration_sign=self.expected_expiration_sign,
-                flow_reference=dict(gas_temperature_c=a.gas_temperature_c,
-                                    absolute_pressure_mbar=a.absolute_pressure_mbar),
-                software_hashes={name: hashlib.sha256(Path(SCRIPT_DIR, name).read_bytes()).hexdigest()
-                                 for name in SOFTWARE_FILES},
-                firmware=metadata, time_origin='STARTED read-completion-relative microseconds',
-                start_ack=None, end_ack=None, boundaries=[], complete=False,
-                tail_truncated=True, termination_reason='open', rows=0, missing_rows=0, invalid_rows=0)
-            self.manifest['config_sha256'] = config_fingerprint(self.manifest)
-            self._save_manifest()
-        except Exception as exc:
-            for stream in files:
+            for index in range(10000):
+                name = base + (f"_{index:02d}" if index else "")
+                data = Path(self.directory) / (name + ".csv")
+                summary = Path(self.directory) / (name + "_session.json")
                 try:
+                    stream = open(data, "x", newline="")
+                except FileExistsError:
+                    continue
+                try:
+                    marker = open(summary, "x")
+                    marker.close()
+                except FileExistsError:
                     stream.close()
-                except OSError as close_error:
-                    print(f'-> storage fault closing failed allocation: {close_error}')
-            self._record_file = self._peak_file = None
-            self._record_writer = self._peak_writer = None
-            self._record_path = self._peak_path = self._manifest_path = None
-            self.manifest = None
-            print(f'-> recording fault allocating recording: {exc}')
-            if paths:
-                print(f'-> partial allocation files retained: {paths}')
+                    data.unlink()
+                    continue
+                except Exception:
+                    stream.close()
+                    data.unlink()
+                    raise
+                owned = [data, summary]
+                self._record_file = stream
+                self._record_path, self._manifest_path = map(str, owned)
+                break
+            else:
+                raise OSError("could not allocate unique recording names")
+            self._record_writer = csv.DictWriter(self._record_file, fieldnames=SAMPLE_COLUMNS)
+            self._record_writer.writeheader()
+            self.manifest = dict(
+                protocol_version=3,
+                sample_schema=4,
+                run_id=run_id,
+                mode=mode,
+                preset=preset,
+                measurements=Path(self._record_path).name,
+                firmware=metadata,
+                software_hashes={
+                    name: hashlib.sha256(Path(SCRIPT_DIR, name).read_bytes()).hexdigest()
+                    for name in SOFTWARE_FILES
+                },
+                analysis_options=self.analysis_options,
+                analysis_result=name + "_analysis.json",
+                start_ack=None,
+                end_ack=None,
+                complete=False,
+                storage_complete=False,
+                quality_complete=False,
+                planned_duration_reached=False,
+                rows=0,
+                termination_reason="open",
+                failure_reason=None,
+                tail_truncated=True,
+                invalid_rows=0,
+                missing_rows=0,
+                missed_acquisition_slots=0,
+                firmware_tx_drops=0,
+                invalid_flow_rows=0,
+                invalid_pressure_rows=[0] * 7,
+                boundaries=[],
+                boundaries_omitted=0,
+            )
+            self._save_manifest()
+            return self.paths
+        except Exception as exc:
+            if self._record_file is not None:
+                try:
+                    self._record_file.close()
+                except OSError:
+                    pass
+            self._record_file = self._record_writer = None
+            print(f"-> recording allocation failed: {exc}; retained paths: {owned}")
             return None
-        self.started = self.failed = False
-        self.failure_reason = None
-        self.rows = self.bad_lines = self.orientation_mismatches = 0
-        self._phase_first = self._phase_last = None
-        self._completed_phase_count = 0
-        self._last_completed_phase = None
-        self._first_phase_complete = False
-        return paths
+
+    def _save_manifest(self):
+        save_json(self._manifest_path, self.manifest)
 
     def start(self, start_ms, start_us):
-        self.analysis.set_origin(start_ms, start_us)
-        self.manifest['boundaries'] = self.analysis.boundaries
-        self.manifest['start_ack'] = dict(millis=start_ms, micros=start_us)
+        self.tracker.set_origin(start_ms, start_us)
+        self.manifest["start_ack"] = dict(millis=start_ms, micros=start_us)
         self._save_manifest()
         self.started = True
 
     def consume(self, wire, line, host_unix=None):
         if not self.started or self.failed:
             return None
-        if wire['run_id'] != self.manifest['run_id'] or wire['preset'] != self.manifest['preset']:
-            raise RecordingError('unexpected_session', 'sample identity mismatch')
-        if wire['protocol'] != self.manifest['protocol_version']:
-            raise RecordingError('legacy_row_in_v2_session', 'protocol mismatch')
+        if (
+            wire["run_id"] != self.manifest["run_id"]
+            or wire["preset"] != self.manifest["preset"]
+            or wire["protocol"] != 3
+        ):
+            raise RecordingError("unexpected_session", "sample identity/protocol mismatch")
+        tracker = self.tracker
+        previous_seq = tracker.last_seq
         try:
-            result = self.analysis.push(wire, host_unix=host_unix)
-        except CaptureDiscontinuity as exc:
-            raise RecordingError('capture_discontinuity', exc) from exc
-        except BoardTimeReset as exc:
-            raise RecordingError('board_time_reset', exc) from exc
-        except Exception as exc:
-            traceback.print_exc()
-            raise RecordingError('analysis_fault', exc) from exc
-        sample = result.sample
-        if sample.cycle_id is not None and sample.phase in (0, 1):
-            ordinal = sample.cycle_id*2 + sample.phase
-            if self._phase_first is None:
-                self._phase_first = self._phase_last = ordinal
-            else:
-                # A phase ordinal has the uint32 cycle plus one phase bit.
-                delta = (ordinal-self._phase_last) & 0x1ffffffff
-                if delta > 0xffffffff:
-                    raise RecordingError('capture_discontinuity', 'commanded phase regressed')
-                self._phase_last += delta
-        try:
-            self._record_writer.writerow(sample_record(sample, line))
-            self.rows += 1
-            if self.rows % 100 == 0:
-                self._record_file.flush()
-                self._save_manifest()
-            self._write_events(result.events)
-        except OSError:
-            raise
-        except RecordingError:
-            raise
-        except Exception as exc:
-            traceback.print_exc()
-            raise RecordingError('format_fault', exc) from exc
+            sample = tracker.push(wire, host_unix=host_unix).sample
+        except (CaptureDiscontinuity, BoardTimeReset):
+            self.malformed()
+            return None
+        missing_before = (
+            wire["seq"] if previous_seq is None else ((wire["seq"] - previous_seq) & 0xFFFFFFFF) - 1
+        )
+        self._record_writer.writerow(
+            dict(sample_record(sample, line), missing_before=missing_before)
+        )
+        self.rows += 1
+        self.last_saved_seq = sample.seq
+        self.invalid_flow_rows += not sample.flow_ok
+        for channel, valid in enumerate(sample.pok):
+            self.invalid_pressure_rows[channel] += not valid
+        if self.rows % 100 == 0:
+            self._record_file.flush()
+            self._save_manifest()
         return sample
 
     def malformed(self):
-        if not self.started or self.failed:
-            return
-        self.bad_lines += 1
-        try:
-            events = self.analysis.break_continuity('malformed_data')
-        except Exception as exc:
-            traceback.print_exc()
-            raise RecordingError('analysis_fault', exc) from exc
-        self._write_events(events)
-
-    def _write_events(self, events):
-        for event in events:
-            self._write_peak_row(event)
-
-    def _write_peak_row(self, event):
-        try:
-            self._peak_writer.writerow(event_record(event))
-        except OSError:
-            raise
-        except Exception as exc:
-            traceback.print_exc()
-            raise RecordingError('format_fault', exc) from exc
-        self._peak_file.flush()
-        if event['excursion_complete'] and event['sample'].cycle_id is not None:
-            raw = event['sample'].cycle_id*2+event['sample'].phase
-            ordinal = self._phase_last - ((self._phase_last-raw) & 0x1ffffffff)
-            if ordinal != self._last_completed_phase:
-                self._completed_phase_count += 1
-                self._last_completed_phase = ordinal
-                self._first_phase_complete |= ordinal == self._phase_first
-        if event['excursion_complete'] and self.expected_expiration_sign is not None:
-            expected = 1 if self.expected_expiration_sign == 'positive' else -1
-            if event['sample'].phase == 1:
-                expected *= -1
-            if event['direction'] != expected:
-                self.orientation_mismatches += 1
-                if self.orientation_mismatches == 1:
-                    print('-> flow sign disagrees with configured phase orientation')
-        result = 'unscored' if event['qualified_peak'] is None else str(event['qualified_peak'])
-        print(f"-> peak {event['peak_idx']}: qualified={result}; reasons={','.join(event['reason_codes'])}")
-
-    def _save_manifest(self):
-        if self.manifest is None or self._manifest_path is None:
-            return
-        temporary = self._manifest_path + '.tmp'
-        created = False
-        try:
-            with open(temporary, 'x') as stream:
-                created = True
-                json.dump(self.manifest, stream, indent=2, allow_nan=False)
-                stream.write('\n')
-            os.replace(temporary, self._manifest_path)
-        finally:
-            if created and os.path.exists(temporary):
-                os.unlink(temporary)
-
-    def _phase_summary(self):
-        first, last = self._phase_first, self._phase_last
-        if first is None or last is None:
-            return dict(missing_interior=0, first_phase_partial=False, last_phase_partial=False)
-        interior = max(0, last-first-1)
-        last_complete = last == self._last_completed_phase
-        completed = self._completed_phase_count - self._first_phase_complete
-        if last != first:
-            completed -= last_complete
-        return dict(first_ordinal=first, last_ordinal=last,
-                    missing_interior=max(0, interior-completed),
-                    first_phase_partial=not self._first_phase_complete,
-                    last_phase_partial=not last_complete)
+        if self.started and not self.failed:
+            self.bad_lines += 1
+            self.tracker.break_continuity("malformed_data")
 
     def mark_failure(self, reason):
-        """Called only by the storage owner; keep the first failure after cleanup."""
         self.failed = True
+        self.storage_failed |= reason == "storage_fault"
         self.failure_reason = self.failure_reason or reason
 
-    def finish(self, reason, tail_truncated=False, end_ack=None):
+    def finish(self, reason, tail_truncated=False, end_ack=None, planned_duration_reached=False):
         if end_ack is not None:
-            self.manifest['end_ack'] = end_ack
-        ack = self.manifest.get('end_ack')
+            self.manifest["end_ack"] = end_ack
+        ack = self.manifest.get("end_ack")
         if tail_truncated:
             self.mark_failure(reason)
         if self._record_file is not None:
-            if not self.failed:
+            try:
+                self._record_file.flush()
+                self._record_file.close()
+            except Exception:
+                self.mark_failure("storage_fault")
                 try:
-                    self._write_events(self.analysis.finish())
-                except Exception as exc:
-                    kind = exc.kind if isinstance(exc, RecordingError) else (
-                        'storage_fault' if isinstance(exc, OSError) else 'analysis_fault')
-                    self.mark_failure(kind)
-            for stream in (self._record_file, self._peak_file):
-                try:
-                    stream.flush()
-                    stream.close()
+                    self._record_file.close()
                 except Exception:
-                    self.mark_failure('storage_fault')
-                    try:
-                        stream.close()
-                    except Exception:
-                        pass
-            self._record_file = self._peak_file = None
-            self._record_writer = self._peak_writer = None
-        last_seq = self.analysis.last_seq
-        tail_missing = ack is None or ack['final_enqueued_seq'] != (last_seq if last_seq is not None else -1)
-        tx_drops = self.analysis.firmware_tx_drops
+                    pass
+            self._record_file = self._record_writer = None
+        t = self.tracker
+        tail_missing = ack is None or ack["final_enqueued_seq"] != (
+            self.last_saved_seq if self.last_saved_seq is not None else -1
+        )
+        drops = t.firmware_tx_drops
         if ack is not None:
-            prior = self.analysis.last_sample.tx_dropped_total if self.analysis.last_sample else 0
-            delta = (ack['tx_dropped_total'] - (prior or 0)) & 0xffffffff
+            prior = t.last_sample.tx_dropped_total if t.last_sample else 0
+            delta = (ack["tx_dropped_total"] - (prior or 0)) & 0xFFFFFFFF
             if delta >= 0x80000000:
-                self.mark_failure('capture_discontinuity')
+                self.mark_failure("capture_discontinuity")
             else:
-                tx_drops += delta
-        if self.manifest['start_ack'] is None:
-            self.mark_failure('start_unconfirmed')
-        incomplete = (self.failed or tail_missing or self.analysis.dropped_rows or
-                      self.analysis.missed_acquisition_slots or self.bad_lines or tx_drops)
-        if incomplete and self.failure_reason is None:
-            self.failure_reason = 'stop_unconfirmed' if ack is None else 'capture_incomplete'
+                drops += delta
+        if self.manifest["start_ack"] is None:
+            self.mark_failure("start_unconfirmed")
+        if ack is None:
+            self.mark_failure("stop_unconfirmed")
+        quality = not bool(
+            tail_missing
+            or t.dropped_rows
+            or t.missed_acquisition_slots
+            or self.bad_lines
+            or drops
+            or self.invalid_flow_rows
+            or any(self.invalid_pressure_rows)
+        )
+        storage = not self.storage_failed
+        complete = not self.failed
         self.manifest.update(
-            complete=not bool(incomplete), tail_truncated=bool(tail_missing or tail_truncated),
-            termination_reason=self.failure_reason or reason, failure_reason=self.failure_reason,
-            rows=self.rows, boundaries_omitted=self.analysis.boundaries_omitted, missing_rows=self.analysis.dropped_rows,
-            missed_acquisition_slots=self.analysis.missed_acquisition_slots,
-            firmware_tx_drops=tx_drops, invalid_rows=self.bad_lines,
-            orientation_mismatches=self.orientation_mismatches,
-            populations={name: getattr(self.analysis.detector, name) for name in POPULATIONS},
-            commanded_phases=self._phase_summary())
+            complete=complete,
+            storage_complete=storage,
+            quality_complete=quality,
+            planned_duration_reached=planned_duration_reached or reason == "planned_duration",
+            stop_confirmed=ack is not None,
+            tail_truncated=bool(tail_missing or tail_truncated),
+            termination_reason=self.failure_reason or reason,
+            failure_reason=self.failure_reason,
+            rows=self.rows,
+            missing_rows=t.dropped_rows,
+            missed_acquisition_slots=t.missed_acquisition_slots,
+            firmware_tx_drops=drops,
+            invalid_rows=self.bad_lines,
+            invalid_flow_rows=self.invalid_flow_rows,
+            invalid_pressure_rows=self.invalid_pressure_rows,
+            boundaries=t.boundaries,
+            boundaries_omitted=t.boundaries_omitted,
+            final_segment_id=t.segment_id,
+        )
         try:
             self._save_manifest()
         except Exception:
-            self.mark_failure('storage_fault')
-            self.manifest.update(complete=False, failure_reason=self.failure_reason,
-                                 termination_reason=self.failure_reason)
+            self.mark_failure("storage_fault")
+            self.manifest.update(
+                complete=False,
+                storage_complete=False,
+                failure_reason=self.failure_reason,
+                termination_reason=self.failure_reason,
+            )
         self.started = False
-        return CompletionResult(ack is not None, self.manifest['complete'], self.failure_reason)
+        return CompletionResult(
+            ack is not None,
+            self.manifest["complete"],
+            self.failure_reason,
+            quality,
+            self.manifest["planned_duration_reached"],
+            self.manifest["storage_complete"],
+        )

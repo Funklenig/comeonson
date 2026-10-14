@@ -3,7 +3,6 @@
 #include "scan_snapshot.h"
 class Transport {
  public:
-  explicit Transport(bool is_calibration) : calibration(is_calibration) {}
   // 'B' = acknowledged START, 'E' = matching STOP; other keys go to sketch.
   char poll();
   void serviceTx();
@@ -21,7 +20,6 @@ class Transport {
   int preset = -1;
   char run_id[17] = "";
  private:
-  bool calibration;
   static constexpr size_t TX_SIZE = 640;
   static constexpr uint8_t TX_COUNT = 8;
   struct TxRecord { char bytes[TX_SIZE]; uint16_t size, offset; };
@@ -36,7 +34,7 @@ class Transport {
   char ended_id[17] = "", run_mode[5] = "";
   static constexpr uint8_t COMPLETED_CAPACITY = 64;
   char completed_ids[COMPLETED_CAPACITY][17]{};
-  uint8_t completed_count = 0;
+  uint8_t completed_count = 0, completed_next = 0;
   char ended_marker[128] = "", started_marker[128] = "";
   int meta_step = -1;
   char rx_frame[64];

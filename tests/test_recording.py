@@ -17,7 +17,7 @@ from serial_link import SerialLink, IncompleteShutdownError
 RID = '0123456789abcdef'
 
 
-def row(seq=0, version=3, preset=-3, position='centre', run_id=RID, missed=0, ms=None):
+def row(seq=0, version=3, preset=0, position='none', run_id=RID, missed=0, ms=None):
     ms = (seq+1)*10 if ms is None else ms
     fields = [f'DATA{version}' if version > 1 else 'DATA', seq, ms, 12, 1, 0,
               *([1]*7), 20, *([1]*7), *([0]*7), 1434, 1434, 0, 0, 0, 0,
@@ -29,7 +29,7 @@ def row(seq=0, version=3, preset=-3, position='centre', run_id=RID, missed=0, ms
     return ','.join(map(str, fields))
 
 
-def metadata(version=3, role='calibration'):
+def metadata(version=3, role='production'):
     if version == 2:
         return {key: '1' for key in META_KEYS}
     result = {key: '1' for key in META_KEYS_V3}
@@ -40,7 +40,7 @@ def metadata(version=3, role='calibration'):
 
 class FakeSerial:
     write_timeout = 1
-    def __init__(self, version=3, role='calibration'):
+    def __init__(self, version=3, role='production'):
         self.rx = queue.Queue()
         self.writes = []
         self.version, self.role = version, role
@@ -78,7 +78,7 @@ class FakeSerial:
             self.sample({'H': 'centre', 'X': 'reference', 'm': 'max', 'n': 'min'}[data.decode()])
         return len(data)
 
-    def sample(self, position='centre', preset=-3):
+    def sample(self, position='none', preset=0):
         self.seq += 1
         self.emit(row(self.seq, self.version, preset, position, self.run_id))
 
@@ -91,9 +91,9 @@ class RecordingTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
 
-    def recording(self, preset=-3, version=3):
-        rec = Recording(directory=self.tmp.name, score_peaks=preset != -3)
-        rec.allocate(RID, 'CAL' if preset == -3 else 'P0', preset, metadata(version))
+    def recording(self, preset=0, version=3):
+        rec = Recording(directory=self.tmp.name)
+        rec.allocate(RID, f'P{preset}', preset, metadata(version))
         rec.start(0, 0)
         self.addCleanup(lambda: rec.finish('cleanup', True) if rec.started else None)
         return rec
@@ -108,7 +108,8 @@ class RecordingTests(unittest.TestCase):
         self.consume(rec, seq=6, missed=3)
         result = rec.finish('host_stop', end_ack=dict(final_enqueued_seq=6, tx_dropped_total=0))
         self.assertTrue(result.stop_confirmed)
-        self.assertFalse(result.recording_complete)
+        self.assertTrue(result.recording_complete)
+        self.assertFalse(result.quality_complete)
         self.assertEqual(rec.manifest['missing_rows'], 5)
         self.assertEqual(rec.manifest['missed_acquisition_slots'], 3)
 
@@ -116,7 +117,8 @@ class RecordingTests(unittest.TestCase):
         rec = self.recording()
         self.consume(rec, missed=1)
         result = rec.finish('host_stop', end_ack=dict(final_enqueued_seq=0, tx_dropped_total=0))
-        self.assertFalse(result.recording_complete)
+        self.assertTrue(result.recording_complete)
+        self.assertFalse(result.quality_complete)
         self.assertEqual(rec.manifest['missing_rows'], 0)
 
     def test_wraps_do_not_add_loss(self):
@@ -130,28 +132,7 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual(analysis.dropped_rows, 0)
         self.assertEqual(analysis.missed_acquisition_slots, 1)
 
-    def test_old_protocols_and_unowned_monitoring(self):
-        for v in (1, 2):
-            parsed = parse_wire(row(version=v, preset=-1, position='none'))
-            self.assertIsNone(parsed['pot_raw_adc'])
-        self.assertIsNone(parse_wire(row(run_id='-'))['run_id'])
-        for invalid in (row().replace(',1414,centre', ',4096,centre'),
-                        row(position='none'), row(version=2, preset=-3),
-                        row(version=2, preset=0, run_id='-')):
-            with self.assertRaises(ValueError):
-                parse_wire(invalid)
 
-    def test_complete_calibration_has_no_peaks(self):
-        rec = self.recording()
-        for seq, position in enumerate(('centre', 'reference', 'max', 'min', 'centre')):
-            self.consume(rec, seq=seq, position=position)
-        result = rec.finish('host_stop', end_ack=dict(final_enqueued_seq=4, tx_dropped_total=0))
-        self.assertTrue(result.recording_complete)
-        self.assertEqual(rec.analysis.detector.count, 0)
-        with open(rec.paths[0]) as stream:
-            rows = list(csv.DictReader(stream))
-        self.assertEqual([r['calibration_position'] for r in rows], ['centre', 'reference', 'max', 'min', 'centre'])
-        self.assertTrue(all(r['pot_raw_adc'] == '1414' for r in rows))
 
     def test_sensor_invalidity_is_distinct_from_missing_capture(self):
         rec = self.recording()
@@ -162,18 +143,18 @@ class RecordingTests(unittest.TestCase):
         self.assertTrue(rec.finish('host_stop', end_ack=dict(final_enqueued_seq=0, tx_dropped_total=0)).recording_complete)
 
     def test_finalizer_failures_reach_result(self):
-        for failure in ('analysis', 'flush', 'manifest'):
+        for failure in ('flush', 'manifest'):
             with self.subTest(failure=failure):
                 rec = self.recording()
                 self.consume(rec)
-                target, attr = {'analysis': (rec.analysis, 'finish'), 'flush': (rec._record_file, 'flush'),
+                target, attr = {'flush': (rec._record_file, 'flush'),
                                 'manifest': (rec, '_save_manifest')}[failure]
                 with patch.object(target, attr, side_effect=OSError('injected')):
                     result = rec.finish('host_stop', end_ack=dict(final_enqueued_seq=0, tx_dropped_total=0))
                 self.assertTrue(result.stop_confirmed)
                 self.assertFalse(result.recording_complete)
                 self.assertIsNotNone(result.failure_reason)
-                with open(rec.paths[2]) as stream:
+                with open(rec.paths[1]) as stream:
                     self.assertFalse(json.load(stream)['complete'])
 
     def test_worker_fault_supersedes_queued_completion(self):
@@ -197,7 +178,7 @@ class SerialTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
 
-    def link(self, version=3, role='calibration'):
+    def link(self, version=3, role='production'):
         fake = FakeSerial(version, role)
         link = SerialLink(None, 115200, 1, serial_instance=fake,
                           recording_directory=self.tmp.name, run_seconds=None)
@@ -205,51 +186,25 @@ class SerialTests(unittest.TestCase):
         self.assertTrue(link.wait_until_ready(1))
         return link, fake
 
-    def test_calibration_command_capture_and_shutdown(self):
-        link, fake = self.link()
-        self.assertTrue(link.begin_timed_run(-3))
-        for key in 'HXmnH':
-            self.assertTrue(link.send_command(key))
-        self.assertTrue(link.stop_run())
-        result = link.close()
-        self.assertTrue(result.recording_complete)
-        self.assertEqual(link.recording.rows, 5)
-        self.assertEqual(link.plots.snapshot().calibration_position, ['centre', 'reference', 'max', 'min', 'centre'])
-        self.assertEqual(link.recording.analysis.detector.count, 0)
-        self.assertTrue(link.worker.join(0))
 
     def test_second_failed_start_has_fresh_statistics(self):
         link, fake = self.link()
-        self.assertTrue(link.begin_timed_run(-3))
+        self.assertTrue(link.begin_timed_run(0))
         fake.sample()
         self.assertTrue(link.stop_run())
         old_run = link.run
         fake.reject_start = True
-        self.assertFalse(link.begin_timed_run(-3))
+        self.assertFalse(link.begin_timed_run(0))
         link.close()
-        self.assertEqual(link.recording.analysis.detector.count, 0)
-        self.assertEqual(link.recording.analysis.dropped_rows, 0)
+        self.assertEqual(link.recording.tracker.dropped_rows, 0)
         self.assertEqual(link.recording.rows, 0)
         link._recording_finished(old_run, old_run.result)
         self.assertEqual(link.last_result.failure_reason, 'start_unconfirmed')
 
-    def test_role_and_version_gate_endpoint_commands(self):
-        for version, role in ((2, 'production'), (3, 'production')):
-            link, fake = self.link(version, role)
-            self.assertFalse(link.begin_timed_run(-3))
-            for key in 'Xmn':
-                self.assertFalse(link.send_command(key))
-                self.assertNotIn(key.encode(), fake.writes)
-            link.close()
-        link, fake = self.link()
-        self.assertFalse(link.send_command('m'))
-        self.assertTrue(link.begin_timed_run(-3))
-        link.metadata['cal_max_dac'] = 'unset'
-        self.assertFalse(link.send_command('m'))
 
     def test_blocked_storage_close_is_explicit_and_recovers(self):
         link, fake = self.link()
-        self.assertTrue(link.begin_timed_run(-3))
+        self.assertTrue(link.begin_timed_run(0))
         entered, release = threading.Event(), threading.Event()
         self.addCleanup(release.set)
         link.worker.submit(lambda: (entered.set(), release.wait())[1] and None)
@@ -264,7 +219,7 @@ class SerialTests(unittest.TestCase):
 
     def test_fault_while_manifest_publication_is_blocked(self):
         link, fake = self.link()
-        self.assertTrue(link.begin_timed_run(-3))
+        self.assertTrue(link.begin_timed_run(0))
         entered, release = threading.Event(), threading.Event()
         self.addCleanup(release.set)
         original = link.recording._save_manifest
@@ -284,19 +239,19 @@ class SerialTests(unittest.TestCase):
         self.assertFalse(link.last_result.recording_complete)
         self.assertTrue(link.last_result.stop_confirmed)
         self.assertEqual(link.last_result.failure_reason, 'transport_fault')
-        with open(link.recording.paths[2]) as stream:
+        with open(link.recording.paths[1]) as stream:
             self.assertFalse(json.load(stream)['complete'])
 
     def test_old_run_invalid_markers_are_ignored(self):
         link, fake = self.link()
-        self.assertTrue(link.begin_timed_run(-3))
+        self.assertTrue(link.begin_timed_run(0))
         link._handle_marker('# STARTED,3,ffffffffffffffff,CAL,bad,bad')
         link._handle_marker('# ENDED,3,ffffffffffffffff,bad,bad,bad')
         self.assertEqual(link.state, 'RUNNING')
 
     def test_concurrent_stop_finalizes_once(self):
         link, fake = self.link()
-        self.assertTrue(link.begin_timed_run(-3))
+        self.assertTrue(link.begin_timed_run(0))
         fake.sample()
         results = []
         threads = [threading.Thread(target=lambda: results.append(link.stop_run())) for _ in range(4)]

@@ -64,17 +64,9 @@ class FirmwareTests(unittest.TestCase):
         cls.temp = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls.temp.cleanup)
         cls.directory = Path(cls.temp.name)
-        library = cls.directory/'library'
-        shutil.copytree(ROOT/'firmware/libraries/MechCommon/src', library)
-        # Synthetic endpoints are NEVER written to the repository or uploaded.
-        config = library/'calibration_values.h'
-        config.write_text(config.read_text().replace('CAL_MIN_DAC = -1', 'CAL_MIN_DAC = 1200')
-                          .replace('CAL_MAX_DAC = -1', 'CAL_MAX_DAC = 1800'))
+        library = ROOT/'firmware/libraries/MechCommon/src'
         for binary, sketch, source_library in (('MechLung','MechLung',library),
-                                               ('calibration','calibration',library),
-                                               ('MechLung_uart','MechLung',library),
-                                               ('calibration_uart','calibration',library),
-                                               ('calibration_unset','calibration',ROOT/'firmware/libraries/MechCommon/src')):
+                                               ('MechLung_uart','MechLung',library)):
             subprocess.run(['g++', '-std=c++17', '-Wall', '-Wextra', '-Werror',
                             *(['-DARDUINO_UNOR4_WIFI', '-DNO_USB'] if binary.endswith('_uart') else []),
                             '-I'+str(ROOT/'tests/firmware_stubs'), '-I'+str(source_library),
@@ -85,7 +77,7 @@ class FirmwareTests(unittest.TestCase):
     def test_r4_wifi_uart_readiness_with_zero_available_for_write(self):
         # Renesas 1.6.0 UART inherits Print.availableForWrite() == 0.
         # Both roles must still deliver the entire validated handshake.
-        for sketch in ('MechLung_uart', 'calibration_uart'):
+        for sketch in ('MechLung_uart',):
             with self.subTest(sketch=sketch):
                 serial = self.harness(sketch)
                 self.assertEqual(serial.command('B'), b'# BAUD,460800\n')
@@ -94,12 +86,12 @@ class FirmwareTests(unittest.TestCase):
                     self.assertTrue(link.wait_until_ready(2))
                     self.assertEqual(link.protocol_version, 3)
                     self.assertEqual(link.metadata['firmware_role'],
-                                     'production' if sketch.startswith('MechLung') else 'calibration')
+                                     'production')
                 finally:
                     link.close()
 
     def test_r4_wifi_115200_bandwidth_loss_cannot_be_complete(self):
-        for sketch, preset in (('MechLung_uart', 0), ('calibration_uart', -3)):
+        for sketch, preset in (('MechLung_uart', 0),):
             with self.subTest(sketch=sketch):
                 serial = self.harness(sketch)
                 serial.command('Z 115200') # Reproduce the old wire rate in a temporary process.
@@ -110,13 +102,15 @@ class FirmwareTests(unittest.TestCase):
                     self.assertTrue(link.wait_until_ready(2))
                     self.assertTrue(link.begin_timed_run(preset))
                     time.sleep(.25)
-                    self.assertFalse(link.stop_run()) # Reports recording loss despite acknowledged STOP.
+                    self.assertTrue(link.stop_run()) # Capture succeeds; quality independently reports loss.
                     result = link.close()
                     self.assertTrue(result.stop_confirmed)
-                    self.assertFalse(result.recording_complete)
-                    with open(link.recording.paths[2]) as stream:
+                    self.assertTrue(result.recording_complete)
+                    self.assertFalse(result.quality_complete)
+                    with open(link.recording.paths[1]) as stream:
                         manifest = json.load(stream)
-                    self.assertFalse(manifest['complete'])
+                    self.assertTrue(manifest['complete'])
+                    self.assertFalse(manifest['quality_complete'])
                     with open(link.recording.paths[0]) as stream:
                         rows = list(csv.DictReader(stream))
                     self.assertGreater(len(rows), 0)
@@ -128,7 +122,7 @@ class FirmwareTests(unittest.TestCase):
                     link.close()
 
     def test_r4_wifi_460800_complete_captures_with_sensor_latency(self):
-        for sketch, preset in (('MechLung_uart', 0), ('calibration_uart', -3)):
+        for sketch, preset in (('MechLung_uart', 0),):
             with self.subTest(sketch=sketch):
                 serial = self.harness(sketch)
                 self.assertEqual(serial.command('B'), b'# BAUD,460800\n')
@@ -145,7 +139,7 @@ class FirmwareTests(unittest.TestCase):
                     result = link.close()
                     self.assertTrue(result.stop_confirmed)
                     self.assertTrue(result.recording_complete)
-                    with open(link.recording.paths[2]) as stream:
+                    with open(link.recording.paths[1]) as stream:
                         self.assertTrue(json.load(stream)['complete'])
                     with open(link.recording.paths[0]) as stream:
                         rows = list(csv.DictReader(stream))
@@ -157,33 +151,6 @@ class FirmwareTests(unittest.TestCase):
                 finally:
                     link.close()
 
-    def test_calibration_capture_real_sketch_to_csv(self):
-        serial = FirmwareSerial(self.directory/'calibration')
-        link = SerialLink(None, 115200, 1, serial_instance=serial, run_seconds=None,
-                          recording_directory=str(self.directory/'captures'))
-        self.addCleanup(link.close)
-        self.assertTrue(link.wait_until_ready(2))
-        self.assertTrue(link.begin_timed_run(-3))
-        for key in 'HXmnH':
-            self.assertTrue(link.send_command(key))
-            time.sleep(.04)
-        self.assertTrue(link.stop_run())
-        self.assertTrue(link.close().recording_complete)
-        with open(link.recording.paths[0]) as stream:
-            rows = list(csv.DictReader(stream))
-        self.assertTrue(rows)
-        self.assertEqual(set(row['calibration_position'] for row in rows), {'centre','reference','max','min'})
-        self.assertEqual([int(row['seq']) for row in rows], list(range(len(rows))))
-        times = [float(row['t_s']) for row in rows]
-        self.assertTrue(all(b>a for a,b in zip(times,times[1:])))
-        expected = {'centre': 1434, 'reference': 1894, 'max': 1800, 'min': 1200}
-        for row in rows:
-            self.assertEqual(int(row['cmd_dac']), expected[row['calibration_position']])
-            self.assertTrue(1400 <= int(row['pot_raw_adc']) < 1500)
-            self.assertEqual(row['flow_ok'], '0')
-            self.assertEqual(row['flow_age_us'], '-1')
-        self.assertEqual(link.recording.analysis.detector.count, 0)
-        self.assertIn('max', link.plots.snapshot().calibration_position)
 
     def test_production_hold_before_and_after_stop(self):
         serial = FirmwareSerial(self.directory/'MechLung')
@@ -205,9 +172,9 @@ class FirmwareTests(unittest.TestCase):
         self.assertTrue(all(b['row_us'] > a['row_us'] for a,b in zip(rows,rows[1:])))
 
     def test_watchdog_and_old_monitor_alias(self):
-        serial = FirmwareSerial(self.directory/'calibration')
+        serial = FirmwareSerial(self.directory/'MechLung')
         self.addCleanup(serial.close)
-        serial.write(b'@START,0123456789abcdef,CAL\n')
+        serial.write(b'@START,0123456789abcdef,P0\n')
         for _ in range(5): serial.read(1024)
         serial.write(b'X')
         for _ in range(5): serial.read(1024)
@@ -218,9 +185,9 @@ class FirmwareTests(unittest.TestCase):
         self.assertIn('# APPLIED,1434', applied)
         serial.write(b'm')
         output = b''.join(serial.read(1024) for _ in range(5)).decode()
-        self.assertIn('start_CAL_session_first', output)
+        self.assertNotIn('# STARTED', output)
 
-    def harness(self, sketch='calibration'):
+    def harness(self, sketch='MechLung'):
         serial = FirmwareSerial(self.directory/sketch)
         self.addCleanup(serial.close)
         return serial
@@ -243,7 +210,7 @@ class FirmwareTests(unittest.TestCase):
     def test_successful_sensor_acquisition_and_each_fault_recovers(self):
         serial = self.harness()
         self.healthy(serial)
-        self.exchange(serial, b'@START,0123456789abcdef,CAL\n')
+        self.exchange(serial, b'@START,0123456789abcdef,P0\n')
         rows = self.rows(self.exchange(serial))
         self.assertGreater(len(rows), 5)
         self.assertTrue(all(r['flow_ok'] and all(r['pok']) for r in rows))
@@ -271,10 +238,10 @@ class FirmwareTests(unittest.TestCase):
     def test_backpressure_preserves_stop_barrier_and_reports_loss(self):
         serial = self.harness()
         self.healthy(serial)
-        self.exchange(serial, b'@START,0123456789abcdef,CAL\n')
+        self.exchange(serial, b'@START,0123456789abcdef,P0\n')
         serial.command('C 0')
         self.exchange(serial, us=200000)
-        self.exchange(serial, b'@START,0123456789abcdef,CAL\n'*8)
+        self.exchange(serial, b'@START,0123456789abcdef,P0\n'*8)
         self.exchange(serial, b'@STOP,0123456789abcdef\n')
         self.assertIn('# APPLIED,1434', serial.command('A').decode())
         serial.command('C 64'); serial.command('L 3')
@@ -288,32 +255,32 @@ class FirmwareTests(unittest.TestCase):
 
     def test_framing_duplicate_commands_stale_ids_and_capacity(self):
         serial = self.harness()
-        output = self.exchange(serial, b'@START,0123456789abcdef,CA')
+        output = self.exchange(serial, b'@START,0123456789abcdef,P')
         self.assertNotIn('# STARTED', output)
-        output = self.exchange(serial, b'L\n')
+        output = self.exchange(serial, b'0\n')
         self.assertIn('# STARTED', output)
         output = self.exchange(serial, b'@STOP,ffffffffffffffff\n')
         self.assertNotIn('# ENDED', output)
-        output = self.exchange(serial, b'@START,0123456789abcdef,CAL\n')
+        output = self.exchange(serial, b'@START,0123456789abcdef,P0\n')
         self.assertIn('# STARTED', output)
         output = self.exchange(serial, b'@STOP,0123456789abcdef\n')
         marker = next(line for line in output.splitlines() if line.startswith('# ENDED'))
         output = self.exchange(serial, b'@STOP,0123456789abcdef\n')
         self.assertIn(marker, output)
-        self.assertNotIn('# STARTED', self.exchange(serial, b'@START,0123456789abcdef,CAL\n'))
+        self.assertNotIn('# STARTED', self.exchange(serial, b'@START,0123456789abcdef,P0\n'))
         for index in range(63):
             rid = f'{index:016x}'
-            self.assertIn('# STARTED', self.exchange(serial, f'@START,{rid},CAL\n'.encode(), 10000))
+            self.assertIn('# STARTED', self.exchange(serial, f'@START,{rid},P0\n'.encode(), 10000))
             self.assertIn('# ENDED', self.exchange(serial, f'@STOP,{rid}\n'.encode(), 10000))
-        self.assertIn('completed_id_capacity_reset_required', self.exchange(serial, b'@START,ffffffffffffffff,CAL\n'))
+        self.assertIn('# STARTED', self.exchange(serial, b'@START,ffffffffffffffff,P0\n'))
 
     def test_invalid_and_expired_frames_cannot_move(self):
         serial = self.harness()
-        for frame in (b'@START,'+b'a'*100+b',CAL\n', b'@START,gggggggggggggggg,CAL\n', b'BE\n'):
+        for frame in (b'@START,'+b'a'*100+b',P0\n', b'@START,gggggggggggggggg,P0\n', b'BE\n'):
             self.assertNotIn('# STARTED', self.exchange(serial, frame))
         self.exchange(serial, b'@START,0123456789abcdef,', 300000)
-        self.assertNotIn('# STARTED', self.exchange(serial, b'CAL\n'))
-        self.assertIn('# STARTED', self.exchange(serial, b'@START,0123456789abcdef,CAL\n'))
+        self.assertNotIn('# STARTED', self.exchange(serial, b'P0\n'))
+        self.assertIn('# STARTED', self.exchange(serial, b'@START,0123456789abcdef,P0\n'))
 
     def test_clock_rollovers_and_sensor_latency(self):
         for clock in (2**32-50000, (2**32-50)*1000):
@@ -324,7 +291,7 @@ class FirmwareTests(unittest.TestCase):
                 serial.command('W '+b'H'.hex())
                 serial.command('T 100')
                 serial.command(f'J {clock}')
-                output = self.exchange(serial, b'@START,0123456789abcdef,CAL\n', 100000)
+                output = self.exchange(serial, b'@START,0123456789abcdef,P0\n', 100000)
                 self.assertIn('# STARTED', output)
                 rows = [r for r in self.rows(output) if r['run_id']]
                 self.assertGreater(len(rows), 5)
@@ -357,17 +324,11 @@ class FirmwareTests(unittest.TestCase):
             rows=list(csv.DictReader(stream))
         self.assertGreater(len(rows), 10)
         self.assertTrue(all(row['flow_ok']=='1' for row in rows))
-        with open(link.recording.paths[2]) as stream:
+        with open(link.recording.paths[1]) as stream:
             self.assertTrue(json.load(stream)['complete'])
 
-    def test_unset_firmware_endpoints_are_rejected(self):
-        serial=self.harness('calibration_unset')
-        self.assertIn('# STARTED',self.exchange(serial,b'@START,0123456789abcdef,CAL\n'))
-        for key in (b'm',b'n'):
-            self.assertIn('configure_rig_endpoint_first',self.exchange(serial,key))
-            self.assertIn('# APPLIED,1434',serial.command('A').decode())
 
-    def test_all_production_waveforms_and_demo(self):
+    def test_all_production_waveforms(self):
         for preset,peak in enumerate((10,15,20,30)):
             with self.subTest(preset=preset):
                 serial=self.harness('MechLung')
@@ -384,11 +345,16 @@ class FirmwareTests(unittest.TestCase):
                     if (a['phase'],a['cycle_id'])==(b['phase'],b['cycle_id']):
                         self.assertGreaterEqual((b['cmd_dac']-a['cmd_dac'])*(1 if b['phase']==0 else -1),0)
                 self.exchange(serial,b'@STOP,0123456789abcdef\n')
+    def test_removed_workflows_never_start_motion(self):
         serial=self.harness('MechLung')
-        output=self.exchange(serial,b'@START,0123456789abcdef,DEMO\n')
-        for _ in range(4):
-            output+=self.exchange(serial,b'@PING,0123456789abcdef\n',1000000)
-        rows=[r for r in self.rows(output) if r['run_id']]
-        self.assertTrue(all(r['preset']==-2 and r['phase']==-1 and r['target_flow_slm']==0 for r in rows))
-        self.assertEqual(min(r['cmd_dac'] for r in rows),100)
-        self.assertEqual(max(r['cmd_dac'] for r in rows),3995)
+        for mode in ('DEMO','CAL'):
+            self.assertNotIn('# STARTED',self.exchange(serial,f'@START,0123456789abcdef,{mode}\n'.encode()))
+        self.exchange(serial,b'sSXxmn1234')
+        self.assertIn('# APPLIED,1434',serial.command('A').decode())
+
+    def test_repeated_runs_do_not_require_a_board_reset(self):
+        serial=self.harness('MechLung')
+        for index in range(70):
+            rid=f'{index+0x100:016x}'
+            self.assertIn('# STARTED',self.exchange(serial,f'@START,{rid},P0\n'.encode(),10000))
+            self.assertIn('# ENDED',self.exchange(serial,f'@STOP,{rid}\n'.encode(),10000))

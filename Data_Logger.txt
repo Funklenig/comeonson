@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mechanical lung logger. Protocol 2/3 captures support deterministic replay.
+"""Mechanical lung logger for the matching production firmware.
 
 Run python Data_Logger.txt --port PORT. See README.md for controls and policy.
 """
@@ -14,21 +14,13 @@ import serial
 import serial.tools.list_ports
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
-from peak_detection import (
-    DEFAULT_MAX_SENSOR_AGE_MS, DEFAULT_PEAK_THRESHOLD_FLOOR,
-    DEFAULT_PEAK_THRESHOLD_FRAC, DEFAULT_PEAK_TOLERANCE_PCT, DEFAULT_WARMUP_BREATHS,
-    PeakDetectionConfig, PeakFlowDetector, centred_moving_average, standard_flow)
-from analysis import MillisUnwrapper
-from recording_schema import Sample, parse_wire
-from recording import PRESET_NAMES, open_unique_csv_pair, open_unique_session
-from serial_link import (SerialLink, COMMANDS, PRESET_KEYS, SAFETY_OVERRIDE_KEYS,
-                         MOTION_OVERRIDE_KEYS, DEFAULT_RUN_SECONDS)
+from recording import PRESET_NAMES
+from serial_link import SerialLink, COMMANDS, PRESET_KEYS, SAFETY_OVERRIDE_KEYS, DEFAULT_RUN_SECONDS
 NUM_PSENS = 7
 PHASE_NAMES = {-1: "n/a", 0: "expiration", 1: "inspiration"}
 
-COMMAND_HELP = ("Click a plot window, then press: "
-                "1-4 preset (auto-records, timed) | s sine | H hold | "
-                "X reference, m max, n min (calibration) | t monitor | p stop/discard run | ? renegotiate after fault | q quit")
+COMMAND_HELP = ("Click a plot: 1–4 preset | H stop and keep | t monitor | "
+                "p stop/discard | ? readiness after fault | q quit")
 
 def list_ports():
     ports = list(serial.tools.list_ports.comports())
@@ -145,93 +137,77 @@ def main():
     ap.add_argument("--avg", type=positive_int, default=9,
                     help="Trailing moving-average window for the live flow "
                          "display and segmentation (samples; default: 9).")
-    ap.add_argument("--peak-smooth", type=positive_int, default=9,
+    ap.add_argument("--peak-smooth", type=int, default=9,
                     help="Centred moving-average window used for offline peak "
                          "location. Independent default: 9; must be odd.")
     ap.add_argument("--buffer", type=positive_float, default=180.0,
                     help="Seconds of history retained in memory.")
-    ap.add_argument("--peak-threshold-frac", type=unit_fraction,
-                    default=DEFAULT_PEAK_THRESHOLD_FRAC,
+    ap.add_argument("--peak-threshold-frac", type=float,
+                    default=0.35,
                     help="Fraction of the current phase target used to open an "
                          "excursion (default: 0.35).")
-    ap.add_argument("--peak-threshold-floor", type=positive_float,
-                    default=DEFAULT_PEAK_THRESHOLD_FLOOR,
+    ap.add_argument("--peak-threshold-floor", type=float,
+                    default=1.5,
                     help="Minimum excursion-opening threshold in slm, also used "
                          "when no phase target is available (default: 1.5).")
-    ap.add_argument("--peak-exit", type=unit_fraction, default=0.5,
+    ap.add_argument("--peak-exit", type=float, default=0.5,
                     help="Excursion closes when |flow| drops below this fraction "
                          "of its latched adaptive threshold.")
-    ap.add_argument("--peak-min-samples", type=positive_int, default=9,
+    ap.add_argument("--peak-min-samples", type=int, default=9,
                     help="Excursions shorter than this are discarded as noise.")
-    ap.add_argument("--peak-plateau", type=unit_fraction, default=0.99,
+    ap.add_argument("--peak-plateau", type=float, default=0.99,
                     help="Plateau = samples within this fraction of the peak; the "
                          "peaks CSV reports the mean pressure across it. The 0.99 "
                          "default limits Q-squared pressure variation to about 2%%.")
-    ap.add_argument("--warmup-breaths", type=nonnegative_int,
-                    default=DEFAULT_WARMUP_BREATHS,
+    ap.add_argument("--warmup-breaths", type=int,
+                    default=3,
                     help="Initial complete breath cycles marked is_warmup in the "
                          "peaks CSV (default: 3; rows are retained).")
-    ap.add_argument("--peak-tolerance-pct", type=percentage,
-                    default=DEFAULT_PEAK_TOLERANCE_PCT,
+    ap.add_argument("--peak-tolerance-pct", type=float,
+                    default=10.0,
                     help="Allowed absolute error from the phase's commanded "
                          "peak flow before the peaks CSV marks a miss "
                          "(default: 10%%).")
-    ap.add_argument("--max-sensor-age-ms", type=positive_float,
-                    default=DEFAULT_MAX_SENSOR_AGE_MS,
+    ap.add_argument("--max-sensor-age-ms", type=float,
+                    default=20.0,
                     help="Maximum flow/pressure sample age at a detected peak "
                          "before sensor_timing_ok is false (default: 20 ms).")
     ap.add_argument("--run-seconds", type=positive_float,
                     default=None,
                     help="Duration of each preset's automatic recording before "
                          "the actuator returns to hold (default: 180).")
-    ap.add_argument("--calibration", action="store_true", help="Record one interactive CAL session; no default time limit.")
     ap.add_argument("--list-ports", action="store_true", help="List serial ports and exit.")
     ap.add_argument('--gas-temperature-c', type=float)
     ap.add_argument('--absolute-pressure-mbar', type=float)
     ap.add_argument('--expected-expiration-sign', choices=('positive', 'negative'))
     ap.add_argument('--max-sample-gap-us', type=positive_float, default=15000)
     args = ap.parse_args()
-    try:
-        standard_flow(1.0, args.gas_temperature_c, args.absolute_pressure_mbar)
-    except ValueError as exc:
-        ap.error(str(exc))
-
     if args.list_ports:
         list_ports()
         return
-
-    try:
-        peak_config = PeakDetectionConfig(
-            threshold_frac=args.peak_threshold_frac,
-            min_threshold=args.peak_threshold_floor,
-            exit_frac=args.peak_exit,
-            min_samples=args.peak_min_samples,
-            plateau_frac=args.peak_plateau,
-            smooth_window=args.peak_smooth,
-            target_tolerance_frac=args.peak_tolerance_pct / 100.0,
-            max_sensor_age_us=args.max_sensor_age_ms * 1000.0,
-            warmup_breaths=args.warmup_breaths,
-            max_sample_gap_us=args.max_sample_gap_us,
-        )
-    except ValueError as exc:
-        ap.error(str(exc))
+    # Peak validation belongs to analysis of the saved run, after capture.
+    analysis_options = dict(avg_window=args.avg, gas_temperature_c=args.gas_temperature_c,
+        absolute_pressure_mbar=args.absolute_pressure_mbar,
+        expected_expiration_sign=args.expected_expiration_sign,
+        config=dict(threshold_frac=args.peak_threshold_frac, min_threshold=args.peak_threshold_floor,
+                    exit_frac=args.peak_exit, min_samples=args.peak_min_samples,
+                    plateau_frac=args.peak_plateau, smooth_window=args.peak_smooth,
+                    target_tolerance_frac=args.peak_tolerance_pct/100,
+                    max_sensor_age_us=args.max_sensor_age_ms*1000,
+                    warmup_breaths=args.warmup_breaths,max_sample_gap_us=args.max_sample_gap_us))
     port = args.port or pick_port()
     print(f"Connecting to {port} @ {args.baud}...")
     try:
-        link = SerialLink(port, args.baud, args.avg,
-                          buffer_seconds=args.buffer,
-                          peak_config=peak_config,
-                          run_seconds=args.run_seconds if args.run_seconds is not None else (None if args.calibration else DEFAULT_RUN_SECONDS),
-                          gas_temperature_c=args.gas_temperature_c,
-                          absolute_pressure_mbar=args.absolute_pressure_mbar,
-                          expected_expiration_sign=args.expected_expiration_sign)
+        link = SerialLink(port, args.baud, args.avg, buffer_seconds=args.buffer,
+                          run_seconds=args.run_seconds or DEFAULT_RUN_SECONDS,
+                          analysis_options=analysis_options)
     except (serial.SerialException, OSError) as e:
         sys.exit(f"Couldn't open {port}: {e}\n"
                  f"Close the Arduino Serial Monitor (only one program can hold "
                  f"the port) and check the board is plugged in.")
 
     try:
-        run_gui(link, args, peak_config)
+        run_gui(link, args)
     except KeyboardInterrupt:
         pass
     finally:
@@ -240,7 +216,7 @@ def main():
             sys.exit(f'Recording incomplete: {result.failure_reason}; stop confirmed={result.stop_confirmed}')
 
 
-def run_gui(link, args, peak_config):
+def run_gui(link, args):
     # Native USB port opening may not reset the board. Wait through normal
     # centre-hold, then require an acknowledgement emitted only from loop().
     time.sleep(2.5)
@@ -248,8 +224,6 @@ def run_gui(link, args, peak_config):
         sys.exit(f"Firmware did not acknowledge readiness within {args.ready_timeout:g} seconds; "
                  "the board may still be booting or running an incompatible "
                  "sketch.")
-    if args.calibration and not link.begin_timed_run(-3):
-        sys.exit('Calibration session could not start; upload protocol-3 calibration firmware.')
     print(f"Connected. {COMMAND_HELP}\n")
 
     # Free up the keys we use from matplotlib's default keymaps (h/s/q/etc.
@@ -271,7 +245,7 @@ def run_gui(link, args, peak_config):
                 return
             if link.begin_timed_run(int(key) - 1, key):
                 print(f"-> sent '{key}'  ({COMMANDS[key]})")
-        elif key in SAFETY_OVERRIDE_KEYS or key in MOTION_OVERRIDE_KEYS:
+        elif key in SAFETY_OVERRIDE_KEYS:
             link.send_command(key)
         elif key in COMMANDS:
             if link.send_command(key):
@@ -289,14 +263,6 @@ def run_gui(link, args, peak_config):
     avg_line, = ax_flow.plot([], [], lw=2, color="#1f6feb", label=f"smoothed (avg {args.avg})")
     target_line, = ax_flow.plot([], [], lw=1.2, ls="--", color="#7b1fa2",
                                 label="geometric target (local L/min)")
-    # Adaptive opening/exit levels follow the current phase target. The peak
-    # detector latches them per excursion; these lines are a live preview.
-    threshold_guides = []
-    for multiplier, style in ((1.0, "--"), (peak_config.exit_frac, ":")):
-        for sign in (1, -1):
-            guide = ax_flow.axhline(0, color="#c62828", lw=0.7,
-                                    ls=style, alpha=0.6)
-            threshold_guides.append((guide, multiplier, sign))
     ax_flow.axhline(0, color="#999", lw=0.8)
     ax_flow.set_xlabel("Time (s)")
     ax_flow.set_ylabel("Flow (slm)")
@@ -358,24 +324,27 @@ def run_gui(link, args, peak_config):
         raw_line.set_data(tw, raw_w)
         avg_line.set_data(tw, avg_w)
         target_line.set_data(tw, target_w)
-        current_threshold = peak_config.opening_threshold(target_peak[-1])
-        for guide, multiplier, sign in threshold_guides:
-            guide.set_ydata([sign * current_threshold * multiplier] * 2)
         set_xwindow(ax_flow, t)
         autoscale(ax_flow, raw_w + avg_w + target_w)
         remaining = link.run_remaining()
         recording = link.run_in_progress()
         rec = (f" [RUN {remaining:5.1f}s]" if remaining is not None else
                (" [REC]" if recording else ""))
-        link_state = ("CONNECTED" if link.connected else
+        link_state = (f"CONNECTED; {link.state}" if link.connected else
                       f"DISCONNECTED: {link.connection_error or 'reader stopped'}")
+        outcome = ""
+        if link.last_result is not None:
+            result = link.last_result
+            job = link.run.analysis_job
+            analysis_state = (job.result.get('status') if job and job.done.is_set() else 'pending')
+            outcome = (f"\nSaved: {result.storage_complete}; stop confirmed: {result.stop_confirmed}; "
+                       f"quality: {'complete' if result.quality_complete else 'affected'}; analysis: {analysis_state}")
         flow_status.set_text(
             f"flow: {flow_avg[-1]:7.2f} slm   "
             f"geometric target: {target_flow[-1]:7.2f} local L/min   "
-            f"threshold: {current_threshold:5.2f} slm   "
             f"phase: {PHASE_NAMES.get(phase[-1], phase[-1])}\n"
             f"[{'OK' if flow_ok[-1] else 'SENSOR FAULT'}; "
-            f"age {flow_age_us[-1] / 1000.0:.2f} ms]{rec}\n{link_state}"
+            f"age {flow_age_us[-1] / 1000.0:.2f} ms]{rec}\n{link_state}{outcome}"
         )
         return raw_line, avg_line, target_line
 
@@ -394,7 +363,7 @@ def run_gui(link, args, peak_config):
             f"cmd: {cmd_pct[-1]:6.1f}%   fdbk: {fdbk_pct[-1]:6.1f}%   "
             f"({cmd_dac[-1]:4d}/{feedback_dac[-1]:7.2f} DAC)   "
             f"mode: {PRESET_NAMES.get(preset[-1], preset[-1])}"
-            f"   raw A1: {snapshot.pot_raw_adc[-1]}   target: {snapshot.calibration_position[-1]}"
+            f"   raw A1: {snapshot.pot_raw_adc[-1]}"
             f"{'   [CLAMPED]' if clamped[-1] else ''}"
         )
         return cmd_line, fdbk_line

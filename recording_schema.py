@@ -49,7 +49,7 @@ def valid_metadata(version, metadata):
             return False
     return True
 
-SAMPLE_COLUMNS = ['wire_line'] + list(Sample._fields)
+SAMPLE_COLUMNS = ['wire_line', 'missing_before'] + list(Sample._fields)
 PEAK_COLUMNS = ['peak_idx', 'seq', 'cycle_id', 'phase', 'direction', 'flow_peak_slm',
                 'plateau_reference_flow_slm', 'peak_time_s', 'peak_offset_s',
                 'interpolation_status', 'nearest_sample_seq', 'target_peak_slm',
@@ -77,8 +77,8 @@ def uint32(value):
 
 def parse_wire(line):
     p = line.split(',')
-    protocol = {'DATA': 1, 'DATA2': 2, 'DATA3': 3}.get(p[0])
-    if protocol is None or len(p) != {1: 37, 2: 44, 3: 46}.get(protocol):
+    protocol = 3 if p[0]=='DATA3' else None
+    if protocol is None or len(p) != 46:
         raise ValueError('unknown DATA schema/width')
     def finite(i):
         value = float(p[i])
@@ -97,7 +97,7 @@ def parse_wire(line):
     flow_ok = flag(4)
     pok = [flag(i) for i in range(14, 21)]
     phase, preset, dac = int(p[34]), int(p[35]), int(p[28])
-    if phase not in (-1, 0, 1) or preset not in ((-3, -2, -1, 0, 1, 2, 3) if protocol == 3 else (-2, -1, 0, 1, 2, 3)) or not 0 <= dac <= 4095:
+    if phase not in (-1, 0, 1) or preset not in (-1,0,1,2,3) or not 0 <= dac <= 4095:
         raise ValueError('invalid phase/preset/DAC')
     if (preset >= 0 and phase == -1) or (preset < 0 and phase != -1):
         raise ValueError('phase/preset mismatch')
@@ -109,13 +109,8 @@ def parse_wire(line):
     raw = int(p[44]) if protocol == 3 else None
     position = p[45] if protocol == 3 else None
     if protocol == 3:
-        if not 0 <= raw <= 4095 or position not in POSITIONS:
+        if not 0 <= raw <= 4095 or position != 'none':
             raise ValueError('invalid calibration fields')
-        if preset == -3:
-            if position == 'none' or finite(32) != 0 or finite(33) != 0:
-                raise ValueError('invalid CAL sample')
-        elif position != 'none':
-            raise ValueError('calibration position outside CAL mode')
     return dict(pot_raw_adc=raw, calibration_position=position, protocol=protocol, seq=uint32(p[1]), ms=uint32(p[2]),
                 flow_raw=finite(3), flow_ok=flow_ok, flow_age_us=age(5, flow_ok),
                 pa=[finite(i) for i in range(6, 13)], temp=finite(13), pok=pok,
@@ -150,4 +145,4 @@ def event_record(event):
 
 SOFTWARE_FILES = ('Data_Logger.txt', 'peak_detection.py', 'analysis.py',
                   'recording_schema.py', 'recording.py', 'recording_worker.py',
-                  'serial_link.py', 'plot_buffer.py')
+                  'serial_link.py', 'plot_buffer.py', 'capture.py', 'analysis_runner.py', 'analysis_worker.py')

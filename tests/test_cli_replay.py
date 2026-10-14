@@ -24,7 +24,7 @@ class CliReplayTests(unittest.TestCase):
         session = AnalysisSession(gas_temperature_c=20, absolute_pressure_mbar=1013)
         session.set_origin(0, 0)
         events = []
-        for line in (ROOT/'tests/fixtures/production_data2.csv').read_text().splitlines():
+        for line in (ROOT/'tests/fixtures/production_data3.csv').read_text().splitlines():
             events.extend(session.push(parse_wire(line), host_unix=0).events)
         events.extend(session.finish())
         expected = json.loads((ROOT/'tests/fixtures/production_peaks.json').read_text())
@@ -59,14 +59,16 @@ class CliReplayTests(unittest.TestCase):
                 self.assertEqual(result.returncode,2)
                 self.assertIn('--ready-timeout',result.stderr)
 
-    def test_bad_config_is_argparse_error(self):
-        result = subprocess.run([sys.executable, str(ROOT/'Data_Logger.txt'), '--port', 'unused',
-                                 '--peak-smooth', '2'], capture_output=True, text=True)
-        self.assertEqual(result.returncode, 2)
-        self.assertIn('smooth_window must be odd', result.stderr)
-        self.assertNotIn('Traceback', result.stderr)
+    def test_analysis_config_does_not_block_capture_factory(self):
+        entry=runpy.run_path(str(ROOT/'Data_Logger.txt'))
+        factory=Mock(side_effect=RuntimeError('capture factory reached'))
+        entry['main'].__globals__['SerialLink']=factory
+        with patch.object(sys,'argv',['logger','--port','fake','--peak-smooth','2']):
+            with self.assertRaisesRegex(RuntimeError,'capture factory reached'):
+                entry['main']()
+        factory.assert_called_once()
 
-    def test_calibration_gui_callbacks_render_named_snapshots(self):
+    def test_production_gui_callbacks_render_snapshots(self):
         with tempfile.TemporaryDirectory() as directory:
             fake = FakeSerial()
             link = SerialLink(None, 115200, 1, serial_instance=fake, run_seconds=None,
@@ -76,7 +78,9 @@ class CliReplayTests(unittest.TestCase):
             callbacks = []
             real_sleep = time.sleep
             def show():
-                for key in 'HXmnH':
+                link.begin_timed_run(0)
+                fake.sample()
+                for key in 'H':
                     link.send_command(key)
                 self.assertTrue(link.stop_run())
                 for callback in callbacks:
@@ -85,9 +89,8 @@ class CliReplayTests(unittest.TestCase):
                     plt.figure(number).canvas.draw()
                 actuator = plt.figure(2).axes[0]
                 self.assertIn('raw A1: 1414', actuator.texts[0].get_text())
-                self.assertIn('target: centre', actuator.texts[0].get_text())
             entry = runpy.run_path(str(ROOT/'Data_Logger.txt'))
-            with patch.object(sys, 'argv', ['Data_Logger.txt','--port','fake','--calibration']), \
+            with patch.object(sys, 'argv', ['Data_Logger.txt','--port','fake']), \
                  patch('serial_link.SerialLink', return_value=link), \
                  patch('matplotlib.animation.FuncAnimation', side_effect=lambda fig, fn, **kw: callbacks.append(fn)), \
                  patch('matplotlib.pyplot.show', side_effect=show), \

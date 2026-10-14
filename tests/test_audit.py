@@ -31,23 +31,23 @@ class IntegrityAuditTests(unittest.TestCase):
         for field, value in (('seq', 0), ('seq', 0xffffffff), ('scan_id', 1),
                              ('missed_slots_total', 0), ('tx_dropped_total', 0)):
             with self.subTest(field=field, value=value), tempfile.TemporaryDirectory() as directory:
-                rec = Recording(directory=directory, score_peaks=False)
-                rec.allocate(RID, 'CAL', -3, metadata())
+                rec = Recording(directory=directory)
+                rec.allocate(RID, 'P0', 0, metadata())
                 rec.start(0, 0)
                 initial = wire()
                 if field.endswith('_total'):
                     initial[field] = 1
                 rec.consume(initial, row())
                 try:
-                    with self.assertRaises(RecordingError):
-                        rec.consume(dict(wire(1), **{field: value}), row(1))
+                    self.assertIsNone(rec.consume(dict(wire(1), **{field: value}), row(1)))
+                    self.assertEqual(rec.bad_lines,1)
                 finally:
                     rec.finish('test', True)
 
     def test_end_counter_regression_cannot_complete(self):
         with tempfile.TemporaryDirectory() as directory:
-            rec = Recording(directory=directory, score_peaks=False)
-            rec.allocate(RID, 'CAL', -3, metadata())
+            rec = Recording(directory=directory)
+            rec.allocate(RID, 'P0', 0, metadata())
             rec.start(0, 0)
             rec.consume(wire(), row())
             result = rec.finish('host_stop', end_ack={'final_enqueued_seq': 0, 'tx_dropped_total': 0xffffffff})
@@ -55,8 +55,8 @@ class IntegrityAuditTests(unittest.TestCase):
 
     def test_end_without_start_cannot_complete(self):
         with tempfile.TemporaryDirectory() as directory:
-            rec = Recording(directory=directory, score_peaks=False)
-            rec.allocate(RID, 'CAL', -3, metadata())
+            rec = Recording(directory=directory)
+            rec.allocate(RID, 'P0', 0, metadata())
             self.assertFalse(rec.finish('host_stop', end_ack={'final_enqueued_seq': -1, 'tx_dropped_total': 0}).recording_complete)
 
     def test_oversized_integer_row_is_counted_as_malformed(self):
@@ -114,8 +114,12 @@ class GuiAuditTests(unittest.TestCase):
             self.addCleanup(link.close)
             entry = runpy.run_path(str(ROOT/'Data_Logger.txt'))
             entry['main'].__globals__['SerialLink'] = lambda *a, **kw: link
-            with patch.object(sys, 'argv', ['logger', '--port', 'fake', '--calibration']), \
-                 patch('matplotlib.pyplot.subplots', side_effect=RuntimeError('display failed')), \
+            def fail_plot(*args,**kwargs):
+                self.assertTrue(link.begin_timed_run(0))
+                fake.sample()
+                raise RuntimeError('display failed')
+            with patch.object(sys, 'argv', ['logger', '--port', 'fake']), \
+                 patch('matplotlib.pyplot.subplots', side_effect=fail_plot), \
                  patch('time.sleep', return_value=None):
                 with self.assertRaisesRegex(RuntimeError, 'display failed'):
                     entry['main']()
@@ -136,19 +140,12 @@ class ControlAuditTests(unittest.TestCase):
         self.assertTrue(link.wait_until_ready(1))
         return link, fake
 
-    def test_calibration_hold_remains_available_after_fault(self):
-        link, fake = self.link()
-        self.assertTrue(link.begin_timed_run(-3))
-        link._fault('transport_fault')
-        before = len(fake.writes)
-        link.send_command('H')
-        self.assertIn(b'\nH', fake.writes[before:])
 
     def test_closed_link_cannot_allocate_another_recording(self):
         link, fake = self.link()
         link.close()
         with patch('serial_link.Recording') as recording:
-            self.assertFalse(link.begin_timed_run(-3))
+            self.assertFalse(link.begin_timed_run(0))
         recording.assert_not_called()
 
     def test_boot_discards_partial_handshake(self):
@@ -160,7 +157,7 @@ class ControlAuditTests(unittest.TestCase):
 
     def test_delayed_stop_ack_has_separate_storage_deadline(self):
         link, fake = self.link()
-        self.assertTrue(link.begin_timed_run(-3))
+        self.assertTrue(link.begin_timed_run(0))
         write, finish = fake.write, link.recording.finish
         timers = []
         def delayed_write(data):
@@ -184,7 +181,7 @@ class ControlAuditTests(unittest.TestCase):
 
     def test_finalization_uses_its_deadline_not_capture_latency(self):
         link, fake = self.link()
-        self.assertTrue(link.begin_timed_run(-3))
+        self.assertTrue(link.begin_timed_run(0))
         finish = link.recording.finish
         def delayed_finish(*args):
             time.sleep(.1)
@@ -195,17 +192,17 @@ class ControlAuditTests(unittest.TestCase):
 
     def test_stale_timer_cannot_stop_a_new_run(self):
         link, fake = self.link()
-        self.assertTrue(link.begin_timed_run(-3))
+        self.assertTrue(link.begin_timed_run(0))
         generation = link._run_generation
         self.assertTrue(link.stop_run())
         self.assertTrue(link.worker.join(1))
-        self.assertTrue(link.begin_timed_run(-3))
+        self.assertTrue(link.begin_timed_run(0))
         link._on_run_timeout(generation)
         self.assertEqual(link.state, 'RUNNING')
 
     def test_reader_disconnect_finalizes_incomplete_and_exits(self):
         link, fake = self.link()
-        self.assertTrue(link.begin_timed_run(-3))
+        self.assertTrue(link.begin_timed_run(0))
         with patch.object(fake, 'read', side_effect=OSError('disconnected')):
             link._thread.join(1)
         self.assertFalse(link._thread.is_alive())
@@ -213,15 +210,16 @@ class ControlAuditTests(unittest.TestCase):
         self.assertFalse(link.last_result.recording_complete)
         self.assertFalse(link.last_result.stop_confirmed)
 
-    def test_duplicate_rows_fault_real_worker(self):
-        link, fake = self.link()
-        self.assertTrue(link.begin_timed_run(-3))
+    def test_duplicate_rows_are_reported_without_ending_capture(self):
+        link,fake=self.link()
+        self.assertTrue(link.begin_timed_run(0))
         fake.sample()
-        fake.emit(row(0, run_id=link.run_id, ms=20))
-        self.assertTrue(link.run.finalized.wait(1))
-        self.assertEqual(link.last_result.failure_reason, 'capture_discontinuity')
-        with open(link.recording.paths[2]) as stream:
-            self.assertFalse(json.load(stream)['complete'])
+        fake.emit(row(0,run_id=link.run_id,ms=20))
+        self.assertTrue(link.stop_run())
+        self.assertEqual(link.recording.rows,1)
+        self.assertTrue(link.last_result.recording_complete)
+        self.assertFalse(link.last_result.quality_complete)
+        self.assertEqual(link.recording.manifest['invalid_rows'],1)
 
     def test_fragmented_malformed_and_oversize_frames(self):
         fake = FakeSerial()
@@ -234,25 +232,25 @@ class ControlAuditTests(unittest.TestCase):
 
     def test_storage_write_failure_is_persisted(self):
         link, fake = self.link()
-        self.assertTrue(link.begin_timed_run(-3))
+        self.assertTrue(link.begin_timed_run(0))
         with patch.object(link.recording._record_writer, 'writerow', side_effect=OSError('disk full')):
             fake.sample()
             self.assertTrue(link.run.finalized.wait(1))
         self.assertEqual(link.last_result.failure_reason, 'storage_fault')
-        with open(link.recording.paths[2]) as stream:
+        with open(link.recording.paths[1]) as stream:
             self.assertFalse(json.load(stream)['complete'])
 
     def test_recording_overflow_faults_without_losing_finalization(self):
         link, fake = self.link()
-        self.assertTrue(link.begin_timed_run(-3))
+        self.assertTrue(link.begin_timed_run(0))
         entered, release = threading.Event(), threading.Event()
-        link.worker.capacity = 1
-        link.worker.submit(lambda: (entered.set(), release.wait())[1] and None)
+        self.assertTrue(link.worker.submit(lambda: (entered.set(), release.wait())[1] and None))
         self.assertTrue(entered.wait(1))
+        link.worker.capacity = 1
         try:
             link._handle_data_line(row(0,run_id=link.run_id))
             link._handle_data_line(row(1,run_id=link.run_id))
-            self.assertEqual(link.state, 'FAULTED')
+            self.assertIn(link.state, ('STOPPING','FINALIZING','FAULTED'))
         finally:
             release.set()
         self.assertTrue(link.worker.join(1))
@@ -263,7 +261,7 @@ class ControlAuditTests(unittest.TestCase):
         link, fake = self.link()
         sentinel=Path(link._recording_args[-1])/'existing.csv'
         sentinel.write_text('keep')
-        self.assertTrue(link.begin_timed_run(-3))
+        self.assertTrue(link.begin_timed_run(0))
         fake.sample()
         paths=link.recording.paths
         self.assertTrue(link.abort_run())
@@ -322,30 +320,3 @@ class AdditionalAnalysisTests(unittest.TestCase):
         for key in ('tidal_ml','dac_corr_gain','sfm_scale','slot_us'):
             with self.subTest(key=key):
                 self.assertFalse(valid_metadata(3,dict(metadata(),**{key:'nan'})))
-
-class PhaseSummaryAuditTests(unittest.TestCase):
-    def test_missing_phase_and_duplicate_peaks_count_once_across_cycle_wrap(self):
-        for origin in (0, (2**32-1)*2):
-            with self.subTest(origin=origin), tempfile.TemporaryDirectory() as directory:
-                rec = Recording(directory=directory,
-                                config=PeakDetectionConfig(min_samples=3,smooth_window=1,warmup_breaths=0))
-                rec.allocate(RID, 'P0', 0, metadata(role='production'))
-                rec.start(0,0)
-                seq=0
-                with patch('builtins.print'):
-                    for offset in range(5):
-                        ordinal=origin+offset
-                        # Two complete peaks per populated phase still represent one phase.
-                        for flow in (0,4,8,10,8,4,0)*2:
-                            sample=wire(seq, preset=0,phase=ordinal%2,
-                                        cycle_id=(ordinal//2)&0xffffffff,
-                                        flow_raw=flow if offset!=2 else 0)
-                            rec.consume(sample, row(seq))
-                            seq+=1
-                    result=rec.finish('host_stop',end_ack=dict(final_enqueued_seq=seq-1,tx_dropped_total=0))
-                self.assertTrue(result.recording_complete)
-                summary=rec.manifest['commanded_phases']
-                self.assertEqual(summary['missing_interior'],1)
-                self.assertFalse(summary['first_phase_partial'])
-                self.assertFalse(summary['last_phase_partial'])
-                self.assertEqual(summary['last_ordinal']-summary['first_ordinal'],4)
